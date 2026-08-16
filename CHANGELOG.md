@@ -1,3 +1,24 @@
+## [2.6.3] - 2026-08-02
+
+### Fixed
+- **Headless ask forwarding gate**: forwarding to a parent session now requires **both** `PI_SUBAGENT_CHILD=1` and `PI_SUBAGENT_PARENT_SESSION`. Previously `PI_SUBAGENT_PARENT_SESSION` alone was enough, which hung any unrelated process that inherited the env (tests, ad-hoc node calls, non-subagent headless callers) on a 5-second poll with no responder. Headless callers that are not subagent children fall back to fail-closed (`no UI available`).
+
+## [2.6.2] - 2026-08-02
+
+### Fixed
+- **Subagent mode inherit**: children always apply `PERMISSION_MODES_INHERITED_MODE` when set (no longer skipped when `--permission-mode` is present). Parent republishes the live mode on every `before_agent_start` so mid-session upgrades / fan-out turns see bypass correctly.
+- **Headless ask forwarding gate**: forwarding to a parent session now requires **both** `PI_SUBAGENT_CHILD=1` and `PI_SUBAGENT_PARENT_SESSION`. Previously `PI_SUBAGENT_PARENT_SESSION` alone was enough, which hung any unrelated process that inherited the env (tests, ad-hoc node calls, non-subagent headless callers) on a 5-second poll with no responder. Headless callers that are not subagent children fall back to fail-closed (`no UI available`).
+
+## [2.6.1] - 2026-08-02
+
+### Added
+- **Subagent inherits parent permission mode**: the interactive session publishes `PERMISSION_MODES_INHERITED_MODE` on mode change / session start. Headless `PI_SUBAGENT_CHILD` processes apply that mode after session restore (so parent **bypass** / **auto** / **ask** / **plan** carries into reviewers). Explicit `--permission-mode` on the child still wins. Nested children keep the value they received at spawn.
+
+## [2.6.0] - 2026-07-31
+
+### Added
+- **Subagent ask forwarding**: when a headless child (`!ctx.hasUI`) needs approval and `PI_SUBAGENT_PARENT_SESSION` is set (pi-subagents), the ask is forwarded to the parent interactive session via a filesystem inbox under `~/.pi/agent/sessions/permission-modes-forwarding/`. Parent shows the usual Allow / Allow always / Block UI; Allow always rules are written using the **child** `cwd`. Timeout / missing parent / deny remain fail-closed. Nested subagents that target a non-UI parent still time out and deny (does not chase root). Namespace is separate from gotgenes `permission-forwarding`.
+
 ## [2.5.0] - 2026-07-30
 
 ### Added
@@ -17,6 +38,10 @@
 - **Plan ready dialog floating mid-screen**: stop padding the dialog to the full terminal height (which pushed options upward). Use a bottom-anchored overlay (`anchor: bottom-center`, `maxHeight: 50%`) with options fixed at the bottom of the panel.
 - **Stay in plan mode needing two dismisses**: after Stay/Esc/Refine, sync the plan hash and suppress `agent_end` re-offer for the cooldown window so the dialog does not immediately reopen.
 
+[2.6.3]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.6.2...v2.6.3
+[2.6.2]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.6.1...v2.6.2
+[2.6.1]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.6.0...v2.6.1
+[2.6.0]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.5.0...v2.6.0
 [2.5.0]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.4.2...v2.5.0
 [2.4.2]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.4.0...v2.4.1

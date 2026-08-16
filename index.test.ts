@@ -23,6 +23,12 @@ import {
 	type OutsideWriteSnapshot,
 } from "./utils.ts"
 import { writePlanFile } from "./utils.ts"
+import {
+	listPendingRequests,
+	setAgentDirForTests,
+	writeForwardedRequest,
+	writeForwardedResponse,
+} from "./permission-forwarding.ts"
 
 // ---- minimal fake pi API ------------------------------------------------
 
@@ -1724,5 +1730,239 @@ describe("skill filtering in before_agent_start", () => {
 		expect(result?.systemPrompt).toContain("brainstorming")
 		expect(result?.systemPrompt).not.toContain("writing-plans")
 		expect(result?.systemPrompt).not.toContain("systematic-debugging")
+	})
+})
+
+describe("permission-modes: subagent ask forwarding", () => {
+	let pi: ReturnType<typeof createFakePi>
+	let configTmp: string
+	let agentDir: string
+	const prevParent = process.env.PI_SUBAGENT_PARENT_SESSION
+	const prevChild = process.env.PI_SUBAGENT_CHILD
+
+	beforeEach(() => {
+		pi = createFakePi()
+		configTmp = mkdtempSync(join(tmpdir(), "pm-fwd-idx-cfg-"))
+		agentDir = mkdtempSync(join(tmpdir(), "pm-fwd-idx-agent-"))
+		setConfigPath(join(configTmp, "permission-modes.json"))
+		setModelsPath(join(configTmp, "model-profiles.json"))
+		writeFileSync(
+			join(configTmp, "permission-modes.json"),
+			JSON.stringify({ classifier: { enabled: false } }),
+		)
+		writeFileSync(
+			join(configTmp, "model-profiles.json"),
+			JSON.stringify({ active: "default", default: {} }),
+		)
+		setAgentDirForTests(agentDir)
+		delete process.env.PI_SUBAGENT_PARENT_SESSION
+		delete process.env.PI_SUBAGENT_CHILD
+		permissionModesExtension(makeFakePiForExtension(pi))
+	})
+
+	afterEach(() => {
+		setAgentDirForTests(undefined)
+		rmSync(configTmp, { recursive: true, force: true })
+		rmSync(agentDir, { recursive: true, force: true })
+		if (prevParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION
+		else process.env.PI_SUBAGENT_PARENT_SESSION = prevParent
+		if (prevChild === undefined) delete process.env.PI_SUBAGENT_CHILD
+		else process.env.PI_SUBAGENT_CHILD = prevChild
+		const shutdown = pi.handlers.get("session_shutdown") ?? []
+		for (const h of shutdown) void h({}, {})
+	})
+
+	it("blocks without parent session when hasUI is false", async () => {
+		await pi.simulateSessionStart(process.cwd())
+		const ctx = makeCtx(pi, { cwd: process.cwd() }) // no ui → hasUI false
+		const result = await pi.simulateToolCall(
+			"bash",
+			{ command: "rm -rf /tmp/x" },
+			ctx,
+		)
+		expect(result).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("no UI available"),
+		})
+	})
+
+	it("fails closed when only PI_SUBAGENT_PARENT_SESSION is set (no PI_SUBAGENT_CHILD)", async () => {
+		// Parent env alone is not enough — must also be a subagent child,
+		// otherwise unrelated processes that inherit parent env would hang
+		// forever waiting for a forwarding response.
+		process.env.PI_SUBAGENT_PARENT_SESSION = "stale-parent-id"
+		delete process.env.PI_SUBAGENT_CHILD
+		await pi.simulateSessionStart(process.cwd())
+		const ctx = makeCtx(pi, { cwd: process.cwd() }) // no ui → hasUI false
+		const result = await pi.simulateToolCall(
+			"read",
+			{ path: "/etc/passwd" },
+			ctx,
+		)
+		expect(result).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("no UI available"),
+		})
+	})
+
+	it("allows when parent responds with approved", async () => {
+		process.env.PI_SUBAGENT_CHILD = "1"
+		process.env.PI_SUBAGENT_PARENT_SESSION = "parent-fwd-1"
+		await pi.simulateSessionStart(process.cwd())
+
+		const ctx = {
+			...makeCtx(pi, { cwd: process.cwd() }),
+			sessionManager: {
+				getBranch: () => [],
+				getGitBranch: () => "",
+				getEntries: () => [],
+				getSessionId: () => "child-fwd-1",
+			},
+		}
+
+		const toolPromise = pi.simulateToolCall(
+			"bash",
+			{ command: "gh pr view 1" },
+			ctx,
+		)
+
+		await vi.waitFor(
+			async () => {
+				const pending = await listPendingRequests(agentDir, "parent-fwd-1")
+				expect(pending.length).toBeGreaterThan(0)
+			},
+			{ timeout: 2000, interval: 20 },
+		)
+
+		const pending = await listPendingRequests(agentDir, "parent-fwd-1")
+		await writeForwardedResponse(agentDir, "parent-fwd-1", {
+			id: pending[0].id,
+			challenge: pending[0].challenge,
+			approved: true,
+			decision: "allow",
+			responderSessionId: "parent-fwd-1",
+			respondedAt: new Date().toISOString(),
+		})
+
+		const result = await toolPromise
+		expect(result).toBeUndefined()
+	})
+
+	it("blocks when parent responds with deny", async () => {
+		process.env.PI_SUBAGENT_CHILD = "1"
+		process.env.PI_SUBAGENT_PARENT_SESSION = "parent-fwd-2"
+		await pi.simulateSessionStart(process.cwd())
+
+		const ctx = makeCtx(pi, { cwd: process.cwd() })
+		const toolPromise = pi.simulateToolCall(
+			"bash",
+			{ command: "curl http://evil" },
+			ctx,
+		)
+
+		await vi.waitFor(
+			async () => {
+				const pending = await listPendingRequests(agentDir, "parent-fwd-2")
+				expect(pending.length).toBeGreaterThan(0)
+			},
+			{ timeout: 2000, interval: 20 },
+		)
+
+		const pending = await listPendingRequests(agentDir, "parent-fwd-2")
+		await writeForwardedResponse(agentDir, "parent-fwd-2", {
+			id: pending[0].id,
+			challenge: pending[0].challenge,
+			approved: false,
+			decision: "block",
+			responderSessionId: "parent-fwd-2",
+			respondedAt: new Date().toISOString(),
+			denialReason: "bash blocked by user",
+		})
+
+		const result = await toolPromise
+		expect(result).toMatchObject({
+			block: true,
+			reason: expect.stringContaining("blocked"),
+		})
+	})
+
+	it("parent poller does not start under PI_SUBAGENT_CHILD=1", async () => {
+		process.env.PI_SUBAGENT_CHILD = "1"
+		process.env.PI_SUBAGENT_PARENT_SESSION = "ignored"
+		let selectCalls = 0
+		await pi.simulateSessionStart(process.cwd(), {
+			select: async () => {
+				selectCalls++
+				return "Allow"
+			},
+		})
+		await writeForwardedRequest({
+			agentDir,
+			targetSessionId: "parent-should-not-poll",
+			tool: "bash",
+			label: "x",
+			category: "user-prompt",
+			cwd: process.cwd(),
+			input: {},
+		})
+		// Force session id mismatch — even if poller started with wrong id it wouldn't match.
+		// Main assert: child process must not call select for inbox.
+		await new Promise((r) => setTimeout(r, 400))
+		expect(selectCalls).toBe(0)
+	})
+})
+
+describe("permission-modes: subagent inherits parent mode", () => {
+	let pi: ReturnType<typeof createFakePi>
+	let configTmp: string
+	const prevChild = process.env.PI_SUBAGENT_CHILD
+	const prevInherited = process.env.PERMISSION_MODES_INHERITED_MODE
+
+	beforeEach(() => {
+		pi = createFakePi()
+		configTmp = mkdtempSync(join(tmpdir(), "pm-inh-cfg-"))
+		setConfigPath(join(configTmp, "permission-modes.json"))
+		setModelsPath(join(configTmp, "model-profiles.json"))
+		writeFileSync(
+			join(configTmp, "permission-modes.json"),
+			JSON.stringify({ classifier: { enabled: false } }),
+		)
+		writeFileSync(
+			join(configTmp, "model-profiles.json"),
+			JSON.stringify({ active: "default", default: {} }),
+		)
+		delete process.env.PI_SUBAGENT_CHILD
+		delete process.env.PERMISSION_MODES_INHERITED_MODE
+		permissionModesExtension(makeFakePiForExtension(pi))
+	})
+
+	afterEach(() => {
+		rmSync(configTmp, { recursive: true, force: true })
+		if (prevChild === undefined) delete process.env.PI_SUBAGENT_CHILD
+		else process.env.PI_SUBAGENT_CHILD = prevChild
+		if (prevInherited === undefined)
+			delete process.env.PERMISSION_MODES_INHERITED_MODE
+		else process.env.PERMISSION_MODES_INHERITED_MODE = prevInherited
+	})
+
+	it("child in inherited bypass allows mutating bash without UI", async () => {
+		process.env.PI_SUBAGENT_CHILD = "1"
+		process.env.PERMISSION_MODES_INHERITED_MODE = "bypass"
+		// Default flag is ask — inheritance must override for children.
+		pi.flags["permission-mode"] = undefined
+		await pi.simulateSessionStart(process.cwd())
+		const ctx = makeCtx(pi, { cwd: process.cwd() }) // no ui
+		const result = await pi.simulateToolCall(
+			"bash",
+			{ command: "rm -rf /tmp/x" },
+			ctx,
+		)
+		expect(result).toBeUndefined()
+	})
+
+	it("parent setMode publishes inherited env", async () => {
+		await pi.simulateSessionStart(process.cwd())
+		await pi.simulateCommand("bypass", "", makeCtx(pi, { cwd: process.cwd(), ui: {} }))
+		expect(process.env.PERMISSION_MODES_INHERITED_MODE).toBe("bypass")
 	})
 })

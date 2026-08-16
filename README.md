@@ -16,7 +16,28 @@ Claude-Code-style **permission modes** for the [pi coding agent](https://www.npm
 
 **Cycle (Shift+Tab):** ask → plan → auto → bypass → ask.
 
-When there is no interactive UI (`pi -p`, `--mode json`), anything that would prompt is **blocked** instead of silently allowed.
+When there is no interactive UI (`pi -p`, `--mode json`), anything that would prompt is **blocked** instead of silently allowed — unless the process is a **pi-subagents child** with `PI_SUBAGENT_PARENT_SESSION` set; then the ask is forwarded to the parent session UI (see below).
+
+### Subagent permission forwarding
+
+Headless subagent children cannot show `ctx.ui.select`. With **pi-subagents**, the root interactive session exports `PI_SUBAGENT_PARENT_SESSION`, and children inherit it (spawn also passes the direct parent session id).
+
+When permission-modes would prompt and `!ctx.hasUI`:
+
+1. If `PI_SUBAGENT_PARENT_SESSION` is unset → **fail-closed block** (same as before).
+2. If set → write a request under  
+   `~/.pi/agent/sessions/permission-modes-forwarding/sessions/<parentSessionId>/requests/`  
+   and poll for a response (250ms interval, 10 minute timeout).
+3. The parent session (has UI, not `PI_SUBAGENT_CHILD=1`) runs a poller that shows  
+   Allow / Allow always (this project) / Allow always (global) / Block.  
+   **Allow always** rules are written using the request’s **child `cwd`**, not the parent cwd.
+4. Timeout, cancel, or Block → child gets a block reason (never silently allowed).
+
+**Limits:** nested subagents whose direct parent has no UI still time out and deny (this package does not rewrite the target to the root session). This inbox path is **not** shared with `@gotgenes/pi-permission-system` (`permission-forwarding/`); the two can coexist without double-handling.
+
+### Subagent inherits parent mode
+
+The interactive session writes `PERMISSION_MODES_INHERITED_MODE` (`ask` | `plan` | `auto` | `bypass`) into the process environment whenever the mode changes (and again on each `before_agent_start`). pi-subagents merges `process.env` into child spawns (and passes `--permission-mode` when that env is set), so headless children start in the **same mode** as the parent (e.g. parent bypass → child auto-approves; no approval popups).
 
 ### Auto classifier (optional)
 

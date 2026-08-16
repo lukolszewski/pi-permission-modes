@@ -99,6 +99,22 @@ import {
   runPlanApprovalDialog,
 } from "./plan-approval-dialog.ts";
 import {
+  createForwardingPoller,
+  defaultAgentDir,
+  isSubagentChildProcess,
+  pollForwardedResponse,
+  resolveParentSessionId,
+  writeForwardedRequest,
+  writeForwardedResponse,
+  type ForwardedDecision,
+  type ForwardedPermissionRequest,
+  type ForwardingPoller,
+} from "./permission-forwarding.ts";
+import {
+  applyInheritedModeForChild,
+  publishInheritedPermissionMode,
+} from "./mode-inherit.ts";
+import {
   ensureModelProfilesConfig,
   getActiveProfileName,
   listProfiles,
@@ -164,6 +180,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   let mergedPermissionRules: PermissionRule[] = [];
   let classifierDenialState: DenialTrackingState = createDenialTrackingState();
   const MAX_CLASSIFIER_FAILURES = 3;
+  let forwardingPoller: ForwardingPoller | undefined;
+  /** Survives poller restarts so the same inbox request is not double-prompted. */
+  const forwardingClaimedIds = new Set<string>();
 
   function applyAutoModePermissionStrip(): void {
     if (currentMode === "auto") {
@@ -228,12 +247,58 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     category: string,
   ): Promise<Block> {
     if (!ctx.hasUI) {
-      pendingComplianceInject = true;
-      complianceCategory = category;
-      return {
-        block: true,
-        reason: `${tool} needs approval: no UI available. ${label}`,
-      };
+      const isChild = isSubagentChildProcess();
+      const parent = resolveParentSessionId();
+      // Only forward to a parent session when we're clearly a subagent child.
+      // PI_SUBAGENT_PARENT_SESSION alone is not sufficient — it's often set in
+      // the parent process env and inherited by unrelated processes (tests,
+      // ad-hoc node calls), which would block forever waiting for a response
+      // that never comes. Fail closed otherwise.
+      if (!parent || !isChild) {
+        pendingComplianceInject = true;
+        complianceCategory = category;
+        return {
+          block: true,
+          reason: `${tool} needs approval: no UI available. ${label}`,
+        };
+      }
+      const agentDir = defaultAgentDir();
+      const requesterSessionId =
+        (ctx.sessionManager as { getSessionId?: () => string })?.getSessionId?.() ??
+        "";
+      const { id, challenge } = await writeForwardedRequest({
+        agentDir,
+        targetSessionId: parent,
+        requesterSessionId,
+        tool,
+        label,
+        category,
+        cwd: ctx.cwd,
+        input,
+      });
+      const resp = await pollForwardedResponse(agentDir, parent, id, {
+        challenge,
+      });
+      if (!resp?.approved) {
+        pendingComplianceInject = true;
+        complianceCategory = category;
+        return {
+          block: true,
+          reason:
+            resp?.denialReason ??
+            `${tool} blocked: parent approval timed out or denied. ${label}`,
+        };
+      }
+      if (
+        resp.decision === "allow_always_local" ||
+        resp.decision === "allow_always_global"
+      ) {
+        reloadMergedPermissionRules(ctx.cwd);
+      }
+      if (tool === "edit" || tool === "write") {
+        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+      }
+      return undefined;
     }
     const choice = await ctx.ui.select(`Allow ${tool}? ${label}`, [
       "Allow",
@@ -583,6 +648,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     updateStatus(ctx);
     await applyProfileModelForMode(mode, ctx);
     persistState();
+    publishInheritedPermissionMode(mode);
   }
 
   function cycleMode(ctx: ExtensionContext): void {
@@ -1597,11 +1663,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       }
       if (tool === "edit" || tool === "write") {
         const pathVal = String(input.path ?? "(unknown)");
-        if (!ctx.hasUI)
-          return {
-            block: true,
-            reason: `${tool} blocked: no UI available to confirm.`,
-          };
+        if (!ctx.hasUI) {
+          return promptApproval(ctx, tool, `on ${pathVal}`, input);
+        }
         const choice = await ctx.ui.select(`Allow ${tool} on ${pathVal}?`, [
           "Allow",
           "Allow always (this project)",
@@ -1652,6 +1716,10 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
   // ---- context injection (system prompt anchor) --------------------------
   pi.on("before_agent_start", async (event, ctx) => {
+    // Keep inherited-mode env fresh so subagents spawned this turn see the
+    // parent's current mode (covers mid-session upgrades / missed setMode).
+    publishInheritedPermissionMode(currentMode);
+
     // Re-apply each turn so other extensions (e.g. hypa replace mode) cannot
     // permanently drop plan-mode tools like ls/grep/find from the active set.
     applyToolRestrictions();
@@ -1971,6 +2039,15 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       /* ignore */
     }
 
+    // Headless subagents ALWAYS inherit the parent's live mode from env when
+    // set (wins over --permission-mode flag and session restore). Review
+    // fan-out must not stay on ask while the parent is in bypass.
+    const inherited = applyInheritedModeForChild();
+    if (inherited) currentMode = inherited;
+
+    // Always publish so nested / later spawns see the effective mode.
+    publishInheritedPermissionMode(currentMode);
+
     classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
     autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
     if (currentMode === "auto") {
@@ -2007,8 +2084,127 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     if (activeProfile) {
       await applyProfileModelForMode(currentMode, ctx);
     }
+
+    startPermissionForwardingPoller(ctx);
+  }
+
+  async function handleForwardedPermissionRequest(
+    ctx: ExtensionContext,
+    request: ForwardedPermissionRequest,
+  ): Promise<void> {
+    const agentDir = defaultAgentDir();
+    const name = request.requesterAgentName?.trim();
+    const title = name
+      ? `[Subagent ${name}] ${request.message}`
+      : `[Subagent] ${request.message}`;
+    const sessionId =
+      (ctx.sessionManager as { getSessionId?: () => string })?.getSessionId?.();
+    // Only the targeted parent session may answer; reject mismatched inbox drain.
+    if (sessionId && sessionId !== request.targetSessionId) {
+      forwardingClaimedIds.delete(request.id);
+      return;
+    }
+    const responderSessionId = request.targetSessionId;
+
+    let decision: ForwardedDecision = "block";
+    let approved = false;
+    let denialReason: string | undefined = `${request.tool} blocked by user`;
+
+    try {
+      const choice = await ctx.ui.select(title, [
+        "Allow",
+        "Allow always (this project)",
+        "Allow always (global)",
+        "Block",
+      ]);
+      if (choice === "Allow") {
+        decision = "allow";
+        approved = true;
+        denialReason = undefined;
+      } else if (choice === "Allow always (this project)") {
+        decision = "allow_always_local";
+        approved = true;
+        denialReason = undefined;
+        const rule = suggestAllowRuleForToolCall(
+          request.tool,
+          request.input,
+          request.cwd,
+        );
+        if (
+          addPermissionRule({
+            rule,
+            behavior: "allow",
+            destination: "local",
+            cwd: request.cwd,
+          })
+        ) {
+          reloadMergedPermissionRules(ctx.cwd);
+          warnIfLocalPermissionsNotGitignored(request.cwd, (msg) =>
+            ctx.ui.notify(msg, "warning"),
+          );
+          ctx.ui.notify(`Added allow rule (project local): ${rule}`);
+        }
+      } else if (choice === "Allow always (global)") {
+        decision = "allow_always_global";
+        approved = true;
+        denialReason = undefined;
+        const rule = suggestAllowRuleForToolCall(
+          request.tool,
+          request.input,
+          request.cwd,
+        );
+        if (
+          addPermissionRule({
+            rule,
+            behavior: "allow",
+            destination: "global",
+            cwd: request.cwd,
+          })
+        ) {
+          reloadMergedPermissionRules(ctx.cwd);
+          ctx.ui.notify(`Added allow rule (global): ${rule}`);
+        }
+      }
+    } catch {
+      decision = "block";
+      approved = false;
+      denialReason = `${request.tool} blocked: parent approval cancelled`;
+    }
+
+    await writeForwardedResponse(agentDir, request.targetSessionId, {
+      id: request.id,
+      challenge: request.challenge,
+      approved,
+      decision,
+      responderSessionId,
+      respondedAt: new Date().toISOString(),
+      ...(denialReason ? { denialReason } : {}),
+    });
+  }
+
+  function startPermissionForwardingPoller(ctx: ExtensionContext): void {
+    forwardingPoller?.stop();
+    forwardingPoller = undefined;
+    if (!ctx.hasUI || isSubagentChildProcess()) return;
+
+    const agentDir = defaultAgentDir();
+    forwardingPoller = createForwardingPoller({
+      agentDir,
+      hasUI: true,
+      isChild: false,
+      claimedIds: forwardingClaimedIds,
+      getSessionId: () =>
+        (ctx.sessionManager as { getSessionId?: () => string })?.getSessionId?.(),
+      onRequest: (request) => handleForwardedPermissionRequest(ctx, request),
+    });
+    forwardingPoller.start();
   }
 
   pi.on("session_start", onSessionStart);
   pi.on("session_tree", onSessionStart);
+  pi.on("session_shutdown", () => {
+    forwardingPoller?.stop();
+    forwardingPoller = undefined;
+    forwardingClaimedIds.clear();
+  });
 }

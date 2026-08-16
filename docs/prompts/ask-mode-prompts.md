@@ -35,7 +35,16 @@ the working directory are auto-approved.
 
 ## 3. UI confirmation prompts
 
-All prompts use `ctx.ui.select(title, options)` and are gated by `ctx.hasUI`. If there is no UI, the operation is **blocked** instead (never silently allowed).
+All prompts use `ctx.ui.select(title, options)` when `ctx.hasUI` is true.
+
+**No-UI behavior (fail-closed, never silently allowed):**
+
+| Condition | Action |
+|---|---|
+| `!ctx.hasUI` and no `PI_SUBAGENT_PARENT_SESSION` | Block with `needs approval: no UI available` |
+| `!ctx.hasUI` and `PI_SUBAGENT_PARENT_SESSION` set | Forward ask to parent session UI via `permission-modes-forwarding` inbox; parent Allow / Allow always / Block; timeout or deny → block |
+
+Local ask-mode `edit`/`write` with UI still offers the five-option dialog (including bypass). Forwarded asks use the shared four-option set only (no bypass).
 
 ### 3a. edit/write approval
 
@@ -55,7 +64,7 @@ All prompts use `ctx.ui.select(title, options)` and are gated by `ctx.hasUI`. If
 | `"Allow all (enable auto)"` | Call `setMode("auto", ctx)` + return `undefined` |
 | `"Block"` | Return `{ block: true, reason: \`${tool} blocked by user on ${path}\` }` |
 
-**No-UI fallback:** `{ block: true, reason: \`${tool} blocked: no UI available to confirm.\` }`
+**No-UI fallback:** without parent session → `{ block: true, reason: \`${tool} blocked: no UI available to confirm.\` }` (via `promptApproval` / forwarding path: `needs approval: no UI available` or parent timeout/deny). With `PI_SUBAGENT_PARENT_SESSION`, forward to parent (four options; no bypass).
 
 ### 3b. read-outside-cwd approval (NEW in v1.1.0)
 
