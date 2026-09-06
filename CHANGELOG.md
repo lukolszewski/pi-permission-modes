@@ -1,3 +1,14 @@
+## [2.6.4] - 2026-09-04
+
+### Changed
+- **CC-TUI working-stats integration**: when the `pi-claude-code-tui`
+  extension is active (it sets `globalThis.__ccTuiActive`), the working
+  stats line (↑/↓ tokens · cache · tok/s · $ · ctx%) is published to
+  `globalThis.__pmWorkingStats` for the TUI's status row instead of being
+  written to pi's working-message slot — removes the duplicate "Working…"
+  line between the transcript and the status bar. Without CC-TUI the
+  behavior is unchanged.
+
 ## [2.6.3] - 2026-08-02
 
 ### Fixed

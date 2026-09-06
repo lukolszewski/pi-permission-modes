@@ -904,6 +904,14 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
   function refreshWorkingMessage(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
+    // Integration: when the CC-TUI extension is active, its status row owns
+    // the working line — publish the stats there instead of occupying pi's
+    // working-message slot (which would render a duplicate second line).
+    const g = globalThis as Record<string, unknown>;
+    if (g.__ccTuiActive === true) {
+      g.__pmWorkingStats = renderWorkingMessage(ctx).replace(/^Working… \(/, "(").replace(/\)$/, "");
+      return;
+    }
     ctx.ui.setWorkingMessage(
       ctx.ui.theme.fg("dim", renderWorkingMessage(ctx)),
     );
