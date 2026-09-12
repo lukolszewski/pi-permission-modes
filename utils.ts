@@ -57,6 +57,10 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
 	/\bsystemctl\s+(start|stop|restart|enable|disable)/i,
 	/\bservice\s+\S+\s+(start|stop|restart)/i,
 	/\b(vim?|nano|emacs|code|subl)\b/i,
+	// Network fetch primitives are never tier-1 read-only (defense in depth;
+	// adjudication ⑤) — data exfiltration and |sh execution vectors.
+	/\bcurl\b/i,
+	/\bwget\b/i,
 ];
 
 // Read-only commands allowed without confirmation.
@@ -84,7 +88,8 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*which\b/,
 	/^\s*whereis\b/,
 	/^\s*type\b/,
-	/^\s*env\b/,
+	// No bare `env` here: `env VAR=x <cmd>` is an execution prefix, and the
+	// SAFE patterns only anchor the start of the command (adjudication ⑤).
 	/^\s*printenv\b/,
 	/^\s*uname\b/,
 	/^\s*whoami\b/,
@@ -104,8 +109,12 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*node\s+-v\b/i,
 	/^\s*python\s+--version/i,
 	/^\s*jq\b/,
-	/^\s*sed\s+-n/i,
-	/^\s*awk\b/,
+	// `sed -n` is read-only except the `w` command, which writes a file
+	// (`1w /path` or the `s///w path` suffix — the w hugs digits/delimiters,
+	// so \b never fires there).
+	/^\s*sed\s+-n(?![^\n]*(?:["',;/0-9}]|\s)w\s*["']?\s*[/~])/i,
+	// No `awk` here: it is an interpreter with system()/redirect execution
+	// vectors that the SAFE match cannot inspect (adjudication ⑤).
 	/^\s*rg\b/,
 	/^\s*fd\b/,
 	/^\s*bat\b/,
@@ -113,8 +122,10 @@ const SAFE_PATTERNS: RegExp[] = [
 ];
 
 // Build/test commands allowed in auto-mode classifier fallback (after blacklist).
+// Also gates tier-2 run-scripts (adjudication ③): offline conservative face
+// must never be looser than the online auto-approve face.
 const AUTO_FALLBACK_SCRIPT_NAMES =
-	"test|build|lint|check|typecheck|verify|coverage|unit|ci"
+	"test|build|lint|check|typecheck|verify|coverage|unit|ci|dev|start|preview|serve|watch"
 const AUTO_FALLBACK_SCRIPT_TAIL = "(?:\\s|$)"
 const AUTO_FALLBACK_BASH_PATTERNS: RegExp[] = [
 	new RegExp(`^\\s*npm\\s+test${AUTO_FALLBACK_SCRIPT_TAIL}`, "i"),
@@ -302,9 +313,7 @@ function matchesAutoFallbackPattern(segment: string): boolean {
 
 /** A command is "safe" iff every shell segment matches the allowlist AND none are destructive. */
 export function isSafeCommand(command: string): boolean {
-	const segments = splitShellSegments(command)
-	if (segments.length === 0) return false
-	return segments.every(isSafeSingleCommand)
+	return segmentsSatisfy(splitShellSegments(command), isSafeSingleCommand)
 }
 
 /** Auto-mode fallback after blacklist: safe read-only OR routine build/test commands. */
@@ -318,26 +327,64 @@ export function isAutoFallbackBash(command: string): boolean {
 	)
 }
 
+function segmentsSatisfy(
+	segments: string[],
+	predicate: (segment: string) => boolean,
+): boolean {
+	return segments.length > 0 && segments.every(predicate)
+}
+
+/**
+ * Both tier verdicts from ONE splitShellSegments pass — the auto-mode tier
+ * ladder calls isSafeCommand and isAutoApprovableBash back to back on the
+ * same command, and each re-tokenized it (plan A4). Pure; equivalent to
+ * calling the two functions separately.
+ */
+export function classifyBashTiers(command: string): {
+	safe: boolean
+	autoApprovable: boolean
+} {
+	const segments = splitShellSegments(command)
+	return {
+		safe: segmentsSatisfy(segments, isSafeSingleCommand),
+		autoApprovable:
+			segments.length > 0 &&
+			segments.every(
+				(seg) =>
+					!hasNestedShellExecution(seg) &&
+					(isSafeSingleCommand(seg) || isAutoApprovableSingleCommand(seg)),
+			),
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Auto-mode auto-approvable commands (broader than isAutoFallbackBash).
 // Common dev workflow commands with controlled side-effects that don't need
 // classifier review in auto mode.
+//
+// Adjudication 2026-09-12 (docs/bash-risk-adjudication-2026-09-12.md):
+// - run-scripts are restricted to the AUTO_FALLBACK_SCRIPT_NAMES whitelist;
+// - git hook vectors (commit/merge/rebase/cherry-pick/revert) and worktree-
+//   loss forms (restore/checkout) are tier-3, not tier-2;
+// - docker run/exec are tier-3 (host-mount execution vectors);
+// - tier-2 reuses the fallback guardrails (unsafe args, outside-cwd paths).
 // ---------------------------------------------------------------------------
 
 // Tier-2 auto approvals (CC-aligned): routine builds/tests and cwd-local git ops.
-// Network fetch, package install, arbitrary interpreters, and git fetch/pull
-// require tier-3 classifier review.
+// Network fetch, package install, arbitrary interpreters, git fetch/pull,
+// git hook vectors, worktree-loss git forms, and docker run/exec require
+// tier-3 classifier review.
 const AUTO_APPROVABLE_PATTERNS: RegExp[] = [
-	// Build / run scripts (named scripts still reviewed by AUTO_FALLBACK for deploy-like names)
-	/^\s*npm\s+run\s+\S+/i,
-	/^\s*(pnpm|yarn|bun)\s+run\s+\S+/i,
+	// Build / run scripts (whitelist-gated; deploy-like names fall to tier-3)
+	new RegExp(`^\\s*npm\\s+run\\s+(${AUTO_FALLBACK_SCRIPT_NAMES})${AUTO_FALLBACK_SCRIPT_TAIL}`, "i"),
+	new RegExp(`^\\s*(pnpm|yarn|bun)\\s+run\\s+(${AUTO_FALLBACK_SCRIPT_NAMES})${AUTO_FALLBACK_SCRIPT_TAIL}`, "i"),
 	/^\s*(make|cmake)\b/i,
 	/^\s*cargo\s+(build|check|clippy|fmt|test)\b/i,
 	/^\s*go\s+(build|vet|fmt|mod|test)\b/i,
-	// Git local write operations (no push/force/fetch/pull)
-	/^\s*git\s+(add|commit|stash|branch|checkout|switch|tag|init|clone)\b/i,
-	/^\s*git\s+(merge|rebase|cherry-pick|revert|reset|restore)\b/i,
-	// File operations within workflow
+	// Git local write operations with no hook vector and no worktree-loss form
+	// (no commit/merge/rebase/cherry-pick/revert/restore/checkout).
+	/^\s*git\s+(add|stash|branch|switch|tag|init|clone|reset)\b/i,
+	// File operations within workflow (outside-cwd paths blocked by guardrails)
 	/^\s*mkdir\b/i,
 	/^\s*touch\b/i,
 	/^\s*cp\b/i,
@@ -353,8 +400,8 @@ const AUTO_APPROVABLE_PATTERNS: RegExp[] = [
 	/^\s*pytest\b/i,
 	/^\s*go\s+test\b/i,
 	/^\s*cargo\s+test\b/i,
-	// Docker local dev (no pull)
-	/^\s*docker\s+(build|compose|run|exec|logs|ps|images)\b/i,
+	// Docker local dev without execution forms (run/exec are tier-3)
+	/^\s*docker\s+(build|compose|logs|ps|images)\b/i,
 ];
 
 const AUTO_APPROVABLE_EXCLUDE: RegExp[] = [
@@ -386,6 +433,10 @@ function isAutoApprovableSingleCommand(command: string): boolean {
 	if (hasNestedShellExecution(command)) return false
 	const normalized = stripFdToFdRedirects(command)
 	if (AUTO_APPROVABLE_EXCLUDE.some((p) => p.test(normalized))) return false
+	// Adjudication ③ (2026-09-12): tier-2 must not be looser than the
+	// classifier-offline fallback — reuse its unsafe-arg and outside-cwd guards.
+	if (hasUnsafeFallbackArgs(normalized)) return false
+	if (hasOutsideCwdFallbackTargets(normalized)) return false
 	return AUTO_APPROVABLE_PATTERNS.some((p) => p.test(normalized))
 }
 
@@ -395,13 +446,7 @@ function isAutoApprovableSingleCommand(command: string): boolean {
  * Every shell segment must be approvable and no segment may be dangerous.
  */
 export function isAutoApprovableBash(command: string): boolean {
-	const segments = splitShellSegments(command)
-	if (segments.length === 0) return false
-	return segments.every(
-		(seg) =>
-			!hasNestedShellExecution(seg) &&
-			(isSafeSingleCommand(seg) || isAutoApprovableSingleCommand(seg)),
-	)
+	return classifyBashTiers(command).autoApprovable
 }
 
 export interface TodoItem {
@@ -637,7 +682,14 @@ export function findProjectRoot(cwd: string): string | null {
  * The marker filename is the canonical source because pi creates it
  * automatically and uses the same hash for kanban boards, memory, etc.
  */
+// Positive-result cache only: once a plan marker file is seen, its id is
+// stable for the cwd. Negative results (hash fallback) stay uncached so a
+// marker created mid-session switches the id over on the next call.
+const projectIdCache = new Map<string, string>()
+
 export function getProjectId(cwd: string): string {
+	const cached = projectIdCache.get(cwd)
+	if (cached) return cached
 	try {
 		const piDir = path.join(cwd, ".pi")
 		if (existsSync(piDir)) {
@@ -647,6 +699,7 @@ export function getProjectId(cwd: string): string {
 			)
 			if (match) {
 				const id = match.replace(/^permission-modes-/, "").replace(/\.md$/, "")
+				projectIdCache.set(cwd, id)
 				return id
 			}
 		}

@@ -1,3 +1,29 @@
+# Changelog
+
+## [2.7.0] - 2026-09-12
+
+### Changed
+- **Bash risk policy adjudication (2026-09-12)** — full rationale in `docs/bash-risk-adjudication-2026-09-12.md`:
+  - Auto mode now strips broad package-manager allow rules (`Bash(npm install *)`, `Bash(pnpm add:*)`, `Bash(pip install:*)`, `Bash(cargo run:*)`, …) on entry, like interpreter rules — such rules bypass the classifier and lifecycle scripts (postinstall / setup.py / build.rs) are arbitrary code runs. Narrow package-scoped rules (`Bash(npm install lodash:*)`) still survive.
+  - git hook vectors (`commit`/`merge`/`rebase`/`cherry-pick`/`revert`) and worktree-loss forms (`restore`, `checkout -- <path>`) drop from tier-2 auto-approve to tier-3 classifier review; `add`/`stash`/`branch`/`switch`/`tag`/`init`/`clone`/`reset` remain tier-2.
+  - `npm|pnpm|yarn|bun run <script>` tier-2 auto-approve is whitelist-gated (test/build/lint/check/typecheck/verify/coverage/unit/ci + dev/start/preview/serve/watch); deploy-like script names go to tier-3.
+  - Tier-2 auto-approve reuses the classifier-offline fallback guardrails: unsafe config/exec flags (`--config`, `--require`, `-exec`, `--script-shell`, …) and outside-cwd path arguments now demote commands to tier-3 (`mv notes.txt ~/`, `mkdir /tmp/x` no longer auto-approve). Principle: the offline conservative face must never be looser than the online auto-approve face.
+  - `docker run`/`docker exec` drop to tier-3 (host-mount execution vectors); `build`/`compose`/`logs`/`ps`/`images` remain tier-2.
+
+### Changed
+- **Typed capability channel to pi-claude-code-tui (plan B7)**: mode and working-stats are now published on a single versioned object `globalThis.__piPermissionModes` (`{version, active, mode, workingStats}`). The legacy untyped `__pmWorkingStats` string (with its literal-prefix contract) keeps publishing for one compatibility cycle; the cctui side reads the capability first and falls back to the legacy keys.
+
+### Performance
+- Tool-call gate: the bypass early-return now runs before the plan-file probe, and `getProjectId` caches positive marker lookups per cwd (a marker created mid-session still switches the id over). `readAgentsMdForClassifier` caches AGENTS.md/CLAUDE.md by (path, mtime) instead of re-reading on every tier-3 classifier call. No behavior change.
+- Streaming stats are now incremental: usage totals accumulate over new branch entries only, instead of re-summing the whole session on every `message_update` chunk (pi freezes the branch while streaming; a moved prefix — navigate/fork/switch — forces a full recompute). Property-tested against the brute-force sum over randomized append/fork/switch sequences; ~100x cheaper per chunk on a 1000-entry session.
+- The auto-mode bash tier ladder tokenizes each command once (`classifyBashTiers`): `isSafeCommand` and `isAutoApprovableBash` previously re-split the same command at every check point.
+- Classifier verdicts are memoized for identical retries (60s TTL, 64-entry bound, key includes modelRef/stage/mode/cwd/autoMode rules/input); reloading permission rules drops the memo so verdicts never go stale against new rules.
+
+### Fixed
+- **Ask-mode approval flow dropped side effects (plan B2)**: the ask-mode inline approval select was a third copy of the approval logic and had diverged — "Allow", "Allow always (this project/global)", and "Allow all (enable bypass)" paths all skipped outside-cwd write tracking (no undo snapshot), allow-always paths skipped the gitignore warning and the "Added allow rule" notification, and `addPermissionRule` results went unchecked. All three approval flows (interactive select, ask-mode inline select, forwarded-parent responder) now execute decisions through a single `applyApprovalDecision` executor, so tracking/persistence/reload/notifications cannot diverge again. Option sets stay per-flow by design (the bypass switch remains ask-mode-only, CC-aligned).
+- **Injection probe was dead at runtime (security, plan B1)**: `scanBranchForInjectionSignals` checked for a `"tool"` role, but pi's branch entries are wrapped as `{type:"message", message:{role:"user"|"assistant"|"toolResult"}}` — the specific-pattern warning never fired, and the test fixture used a fantasy shape that hid it. All session reads now go through a typed `session-branch.ts` port (zero `sessionManager` casts remain in index.ts); auto/bypass mode again injects the specific "Recent tool output matched a possible injection pattern" block when a recent toolResult matches an injection pattern.
+- **Tier-1 read-only bypasses (security)**: `env X=1 <cmd>` and `awk` are no longer treated as read-only in plan mode (`env` executes the suffixed command and SAFE patterns only anchor the start; `awk` has `system()`/redirect execution vectors). `sed -n '…w /path'` write forms are blocked while plain `sed -n 'p'` reads stay allowed. `curl`/`wget` were added to the destructive list as defense in depth.
+
 ## [2.6.4] - 2026-09-04
 
 ### Changed

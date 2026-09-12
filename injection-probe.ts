@@ -48,7 +48,11 @@ function extractTextFromContent(content: unknown): string {
 		.join("\n")
 }
 
-/** Scan recent tool-result messages in the session branch for injection signals. */
+/**
+ * Scan recent tool-result messages in the session branch for injection
+ * signals. Expects unwrapped agent messages (see session-branch.ts) —
+ * pi's tool-result role is "toolResult", never "tool" (plan B1).
+ */
 export function scanBranchForInjectionSignals(
 	branch: BranchMessage[],
 	maxMessages = 12,
@@ -56,7 +60,7 @@ export function scanBranchForInjectionSignals(
 	const recent = branch.slice(-maxMessages)
 	for (let i = recent.length - 1; i >= 0; i--) {
 		const msg = recent[i]
-		if (msg?.role !== "tool") continue
+		if (msg?.role !== "toolResult") continue
 		const text = extractTextFromContent(msg.content)
 		const hit = scanTextForInjectionSignals(text)
 		if (hit) return hit

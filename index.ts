@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import {
   classifyToolCall,
+  invalidateClassifierVerdictCache,
   readAgentsMdForClassifier,
   type ClassifierSessionContext,
 } from "./classifier-client.ts";
@@ -51,6 +52,17 @@ import {
   TOOL_OUTPUT_INJECTION_WARNING,
 } from "./injection-probe.ts";
 import {
+  readBranchEntries,
+  readBranchMessages,
+  readCustomEntryData,
+  readGitBranch,
+  readSessionId,
+} from "./session-branch.ts";
+import {
+  accumulateBranchStats,
+  emptyBranchStatsState,
+} from "./branch-stats.ts";
+import {
   addPermissionRule,
   loadMergedPermissionRules,
   warnIfLocalPermissionsNotGitignored,
@@ -75,7 +87,7 @@ import {
   hashPlan,
   injectModePrompt,
   isAutoFallbackBash,
-  isAutoApprovableBash,
+  classifyBashTiers,
   isOutsideCwd,
   isPlanFilePath,
   isSafeCommand,
@@ -156,6 +168,18 @@ const PLAN_DISABLED = new Set<string>();
 
 type Block = { block: true; reason: string } | undefined;
 
+/**
+ * Cross-extension capability object (plan B7): the single typed channel to
+ * pi-claude-code-tui — globalThis.__piPermissionModes. Duck-typed on both
+ * sides; version gates consumers.
+ */
+export interface PmCapability {
+	version: number;
+	active: boolean;
+	mode: string;
+	workingStats: string | null;
+}
+
 export default function permissionModesExtension(pi: ExtensionAPI): void {
   // ---- state -------------------------------------------------------------
   let currentMode: Mode = "ask";
@@ -198,6 +222,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   function reloadMergedPermissionRules(cwd: string): void {
     basePermissionRules = loadMergedPermissionRules(cwd);
     applyAutoModePermissionStrip();
+    // Memoized verdicts may depend on the old rules — drop them (plan A5).
+    invalidateClassifierVerdictCache();
   }
 
   // ---- model-profile state -----------------------------------------------
@@ -239,6 +265,103 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     });
   }
 
+  type ApprovalDecision =
+    | "allow"
+    | "allow_always_local"
+    | "allow_always_global"
+    | "bypass"
+    | "block";
+
+  /**
+   * Single place that executes an approval decision's side effects:
+   * allow-always persistence + rule reload + gitignore warning + notify,
+   * outside-write tracking on EVERY allow path, compliance-inject on block.
+   * The three approval flows (interactive select, ask-mode inline select,
+   * forwarded-parent responder) used to duplicate this and had diverged —
+   * the ask flow dropped write tracking and notifications (plan B2).
+   * Options narrow execution for the forwarding paths:
+   * - ruleCwd: parent responder persists rules against the child's cwd
+   * - persistRules:false when the other side already persisted (child poll)
+   * - trackWrite:false on the parent responder (tracking is the child's job)
+   * - complianceOnBlock:false in ask mode (no classifier compliance there)
+   */
+  async function applyApprovalDecision(
+    ctx: ExtensionContext,
+    tool: string,
+    input: Record<string, unknown>,
+    decision: ApprovalDecision,
+    opts: {
+      category?: string;
+      ruleCwd?: string;
+      persistRules?: boolean;
+      trackWrite?: boolean;
+      complianceOnBlock?: boolean;
+      blockReason?: string;
+    } = {},
+  ): Promise<Block | undefined> {
+    const ruleCwd = opts.ruleCwd ?? ctx.cwd;
+    const persistRules = opts.persistRules !== false;
+    const trackWrite = opts.trackWrite !== false;
+
+    const trackOutsideWrite = (): void => {
+      if (trackWrite && (tool === "edit" || tool === "write")) {
+        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+      }
+    };
+
+    if (decision === "allow") {
+      trackOutsideWrite();
+      return undefined;
+    }
+    if (
+      decision === "allow_always_local" ||
+      decision === "allow_always_global"
+    ) {
+      if (persistRules) {
+        const rule = suggestAllowRuleForToolCall(tool, input, ruleCwd);
+        if (
+          addPermissionRule({
+            rule,
+            behavior: "allow",
+            destination:
+              decision === "allow_always_local" ? "local" : "global",
+            cwd: ruleCwd,
+          })
+        ) {
+          reloadMergedPermissionRules(ctx.cwd);
+          if (decision === "allow_always_local") {
+            warnIfLocalPermissionsNotGitignored(ruleCwd, (msg) =>
+              ctx.ui.notify(msg, "warning"),
+            );
+          }
+          ctx.ui.notify(
+            decision === "allow_always_local"
+              ? `Added allow rule (project local): ${rule}`
+              : `Added allow rule (global): ${rule}`,
+          );
+        }
+      } else {
+        // Rules were persisted by the other side; just pick them up.
+        reloadMergedPermissionRules(ctx.cwd);
+      }
+      trackOutsideWrite();
+      return undefined;
+    }
+    if (decision === "bypass") {
+      await setMode("bypass", ctx);
+      trackOutsideWrite();
+      return undefined;
+    }
+    if (opts.complianceOnBlock !== false) {
+      pendingComplianceInject = true;
+      complianceCategory = opts.category ?? "user-prompt";
+    }
+    return {
+      block: true,
+      reason: opts.blockReason ?? `${tool} blocked by user`,
+    };
+  }
+
   async function promptWithPermissionOptions(
     ctx: ExtensionContext,
     tool: string,
@@ -264,8 +387,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       }
       const agentDir = defaultAgentDir();
       const requesterSessionId =
-        (ctx.sessionManager as { getSessionId?: () => string })?.getSessionId?.() ??
-        "";
+        readSessionId(ctx.sessionManager) ?? "";
       const { id, challenge } = await writeForwardedRequest({
         agentDir,
         targetSessionId: parent,
@@ -293,12 +415,11 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         resp.decision === "allow_always_local" ||
         resp.decision === "allow_always_global"
       ) {
-        reloadMergedPermissionRules(ctx.cwd);
+        return applyApprovalDecision(ctx, tool, input, resp.decision, {
+          persistRules: false,
+        });
       }
-      if (tool === "edit" || tool === "write") {
-        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
-      }
-      return undefined;
+      return applyApprovalDecision(ctx, tool, input, "allow");
     }
     const choice = await ctx.ui.select(`Allow ${tool}? ${label}`, [
       "Allow",
@@ -306,54 +427,15 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       "Allow always (global)",
       "Block",
     ]);
-    if (choice === "Allow always (this project)") {
-      const rule = suggestAllowRuleForToolCall(tool, input, ctx.cwd);
-      if (
-        addPermissionRule({
-          rule,
-          behavior: "allow",
-          destination: "local",
-          cwd: ctx.cwd,
-        })
-      ) {
-        reloadMergedPermissionRules(ctx.cwd);
-        warnIfLocalPermissionsNotGitignored(ctx.cwd, (msg) =>
-          ctx.ui.notify(msg, "warning"),
-        );
-        ctx.ui.notify(`Added allow rule (project local): ${rule}`);
-      }
-      if (tool === "edit" || tool === "write") {
-        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
-      }
-      return undefined;
-    }
-    if (choice === "Allow always (global)") {
-      const rule = suggestAllowRuleForToolCall(tool, input, ctx.cwd);
-      if (
-        addPermissionRule({
-          rule,
-          behavior: "allow",
-          destination: "global",
-          cwd: ctx.cwd,
-        })
-      ) {
-        reloadMergedPermissionRules(ctx.cwd);
-        ctx.ui.notify(`Added allow rule (global): ${rule}`);
-      }
-      if (tool === "edit" || tool === "write") {
-        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
-      }
-      return undefined;
-    }
-    if (choice !== "Allow") {
-      pendingComplianceInject = true;
-      complianceCategory = category;
-      return { block: true, reason: `${tool} blocked by user` };
-    }
-    if (tool === "edit" || tool === "write") {
-      trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
-    }
-    return undefined;
+    const decision: ApprovalDecision =
+      choice === "Allow always (this project)"
+        ? "allow_always_local"
+        : choice === "Allow always (global)"
+          ? "allow_always_global"
+          : choice === "Allow"
+            ? "allow"
+            : "block";
+    return applyApprovalDecision(ctx, tool, input, decision, { category });
   }
 
   async function promptAutoTier3(
@@ -570,7 +652,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   ): ClassifierSessionContext {
     let branch: ClassifierSessionContext["branch"] = [];
     try {
-      branch = (ctx.sessionManager as any).getBranch?.() ?? [];
+      branch = readBranchEntries(ctx.sessionManager);
     } catch {
       // classifier still runs with pending action only
     }
@@ -649,6 +731,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     await applyProfileModelForMode(mode, ctx);
     persistState();
     publishInheritedPermissionMode(mode);
+    publishCapability({ mode });
   }
 
   function cycleMode(ctx: ExtensionContext): void {
@@ -864,6 +947,12 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     ctx.ui.setWidget("plan-todos", lines);
   }
 
+  // Streaming chunks arrive while the branch is frozen (pi appends entries
+  // on message_end), so per-chunk work is O(new entries), not O(session
+  // length); a moved prefix (navigate/fork/switch) forces a full recompute
+  // (plan A1, property-tested in branch-stats.test.ts).
+  const branchStatsState = emptyBranchStatsState();
+
   function computeStats(ctx: ExtensionContext): {
     input: number;
     output: number;
@@ -871,25 +960,18 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     cacheWrite: number;
     cost: number;
   } {
-    const acc = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
     try {
-      for (const entry of (ctx.sessionManager as any).getBranch() ?? []) {
-        if (entry?.type !== "message") continue;
-        const u = entry.message?.usage;
-        if (!u) continue;
-        acc.input += u.input || 0;
-        acc.output += u.output || 0;
-        acc.cacheRead += u.cacheRead || 0;
-        acc.cacheWrite += u.cacheWrite || 0;
-        acc.cost += u.cost?.total || 0;
-      }
+      return accumulateBranchStats(
+        readBranchEntries(ctx.sessionManager),
+        branchStatsState,
+      );
     } catch {
-      /* ignore */
+      // Render path: keep last totals rather than throw.
+      return { ...branchStatsState.accum };
     }
-    return acc;
   }
 
-  function renderWorkingMessage(ctx: ExtensionContext): string {
+  function workingStatsParts(ctx: ExtensionContext): string[] {
     const s = computeStats(ctx);
     const parts = [`↑${formatCount(s.input)}`, `↓${formatCount(s.output)}`];
     if (s.cacheRead) parts.push(`R${formatCount(s.cacheRead)}`);
@@ -899,7 +981,26 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     if (usage && usage.percent != null) {
       parts.push(`${Math.round(usage.percent)}% ctx`);
     }
-    return `Working… (${parts.join(" · ")})`;
+    return parts;
+  }
+
+  function renderWorkingMessage(ctx: ExtensionContext): string {
+    return `Working… (${workingStatsParts(ctx).join(" · ")})`;
+  }
+
+  // ---- Capability channel to pi-claude-code-tui (plan B7) ------------------
+  // One typed, versioned namespace replaces the untyped globals; the legacy
+  // __pmWorkingStats key stays published for one compatibility cycle (older
+  // cctui builds read it). Consumers detect via `version >= 1`.
+  function publishCapability(patch: Partial<PmCapability>): void {
+    const g = globalThis as Record<string, unknown>;
+    const current = (g.__piPermissionModes as PmCapability | undefined) ?? {
+      version: 1,
+      active: true,
+      mode: currentMode,
+      workingStats: null,
+    };
+    g.__piPermissionModes = { ...current, ...patch, version: 1, active: true };
   }
 
   function refreshWorkingMessage(ctx: ExtensionContext): void {
@@ -908,8 +1009,12 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     // the working line — publish the stats there instead of occupying pi's
     // working-message slot (which would render a duplicate second line).
     const g = globalThis as Record<string, unknown>;
-    if (g.__ccTuiActive === true) {
-      g.__pmWorkingStats = renderWorkingMessage(ctx).replace(/^Working… \(/, "(").replace(/\)$/, "");
+    const ccTuiActive = (g.__piCcTui as { active?: boolean } | undefined)?.active === true || g.__ccTuiActive === true;
+    if (ccTuiActive) {
+      const stats = workingStatsParts(ctx).join(" · ");
+      publishCapability({ workingStats: stats });
+      // Legacy key (one compatibility cycle for older cctui builds).
+      g.__pmWorkingStats = `(${stats})`;
       return;
     }
     ctx.ui.setWorkingMessage(
@@ -1518,15 +1623,18 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   pi.on("tool_call", async (event, ctx): Promise<Block> => {
     const tool = event.toolName;
     const input = (event.input ?? {}) as Record<string, unknown>;
-    const planFilePath = getPlanFilePath(ctx.cwd);
 
     // BYPASS: approve everything; still track outside-cwd writes for undo.
+    // Kept ahead of the plan-file probe: bypass never reads the plan file
+    // and the probe does per-call FS I/O (plan A2).
     if (currentMode === "bypass") {
       if (tool === "edit" || tool === "write") {
         trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
       }
       return undefined;
     }
+
+    const planFilePath = getPlanFilePath(ctx.cwd);
 
     const permResult = await applyConfiguredPermissionRules(ctx, tool, input);
     if (permResult === "allow") return allowToolCall();
@@ -1618,8 +1726,10 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
             "sensitive-path",
           );
         }
+        // Tier 1 / Tier 2 verdicts share one splitShellSegments pass (plan A4).
+        const tiers = cmd ? classifyBashTiers(cmd) : undefined;
         // Tier 1: read-only bash auto-approves.
-        if (cmd && isSafeCommand(cmd)) {
+        if (tiers?.safe) {
           return allowToolCall();
         }
         // Tier 1.5: autoMode.allow user rules short-circuit before classifier.
@@ -1627,7 +1737,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         // preventing "npm install && rm -rf /" from being allowed by a "npm" rule.
         if (cmd && autoModeConfig?.allow?.length) {
           if (autoModeConfig.allow.some((p) => matchAutoModePattern(cmd, p))) {
-            if (isAutoApprovableBash(cmd)) {
+            if (tiers?.autoApprovable) {
               return allowToolCall();
             }
             // Pattern matched but command has dangerous segments → fall through
@@ -1640,7 +1750,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
           }
         }
         // Tier 2: common dev workflow commands auto-approve without classifier.
-        if (cmd && isAutoApprovableBash(cmd)) {
+        if (tiers?.autoApprovable) {
           return allowToolCall();
         }
       }
@@ -1674,6 +1784,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         if (!ctx.hasUI) {
           return promptApproval(ctx, tool, `on ${pathVal}`, input);
         }
+        // The bypass switch stays ask-mode-only (CC-aligned, adjudicated
+        // 2026-09-12); side effects route through the shared executor.
         const choice = await ctx.ui.select(`Allow ${tool} on ${pathVal}?`, [
           "Allow",
           "Allow always (this project)",
@@ -1681,35 +1793,20 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
           "Allow all (enable bypass)",
           "Block",
         ]);
-        if (choice === "Allow always (this project)") {
-          const rule = suggestAllowRuleForToolCall(tool, input, ctx.cwd);
-          addPermissionRule({
-            rule,
-            behavior: "allow",
-            destination: "local",
-            cwd: ctx.cwd,
-          });
-          reloadMergedPermissionRules(ctx.cwd);
-          return undefined;
-        }
-        if (choice === "Allow always (global)") {
-          const rule = suggestAllowRuleForToolCall(tool, input, ctx.cwd);
-          addPermissionRule({
-            rule,
-            behavior: "allow",
-            destination: "global",
-            cwd: ctx.cwd,
-          });
-          reloadMergedPermissionRules(ctx.cwd);
-          return undefined;
-        }
-        if (choice === "Allow all (enable bypass)") {
-          await setMode("bypass", ctx);
-          return undefined;
-        }
-        if (choice !== "Allow")
-          return { block: true, reason: `${tool} blocked by user on ${pathVal}` };
-        return undefined;
+        const decision: ApprovalDecision =
+          choice === "Allow always (this project)"
+            ? "allow_always_local"
+            : choice === "Allow always (global)"
+              ? "allow_always_global"
+              : choice === "Allow all (enable bypass)"
+                ? "bypass"
+                : choice === "Allow"
+                  ? "allow"
+                  : "block";
+        return applyApprovalDecision(ctx, tool, input, decision, {
+          complianceOnBlock: false,
+          blockReason: `${tool} blocked by user on ${pathVal}`,
+        });
       }
       if (tool === "bash") {
         const cmd = String(input.command ?? "");
@@ -1727,6 +1824,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     // Keep inherited-mode env fresh so subagents spawned this turn see the
     // parent's current mode (covers mid-session upgrades / missed setMode).
     publishInheritedPermissionMode(currentMode);
+    publishCapability({ mode: currentMode });
 
     // Re-apply each turn so other extensions (e.g. hypa replace mode) cannot
     // permanently drop plan-mode tools like ls/grep/find from the active set.
@@ -1781,11 +1879,12 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     if (currentMode === "auto" || currentMode === "bypass") {
       injectionBlock = TOOL_OUTPUT_INJECTION_WARNING;
       try {
-        const branch =
-          (ctx.sessionManager as any).getBranch?.() ??
-          (ctx as any).messages ??
-          [];
-        const signal = scanBranchForInjectionSignals(branch);
+        // Real SessionEntry shape comes unwrapped from the port; the legacy
+        // flat `ctx.messages` fallback predates typed access (plan B1).
+        const messages = readBranchMessages(ctx.sessionManager);
+        const signal = scanBranchForInjectionSignals(
+          messages.length > 0 ? messages : (((ctx as any).messages ?? []) as never[]),
+        );
         if (signal) {
           injectionBlock = buildInjectionWarningBlock(signal);
         }
@@ -1854,7 +1953,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   // ---- turn_end: tps + plan-step tracking --------------------------------
   pi.on("turn_end", async (event, ctx) => {
     try {
-      gitBranch = (ctx.sessionManager as any).getGitBranch?.() ?? gitBranch;
+      gitBranch = readGitBranch(ctx.sessionManager) ?? gitBranch;
     } catch {
       /* ignore */
     }
@@ -2022,26 +2121,33 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
     // Restore the latest persisted mode entry (overrides the flag).
     try {
-      const entries = (ctx.sessionManager as any).getEntries?.() ?? [];
-      const last = [...entries]
-        .reverse()
-        .find((e: any) => e?.type === "custom" && e?.customType === "modes");
-      if (last?.data) {
-        let m = last.data.currentMode;
+      const modesData = readCustomEntryData(ctx.sessionManager, "modes");
+      const last = modesData[modesData.length - 1] as
+        | {
+            currentMode?: string;
+            planPhase?: string;
+            planExecuting?: boolean;
+            planTodos?: TodoItem[];
+            lastExtractedPlanHash?: string;
+            activeProfile?: string;
+          }
+        | undefined;
+      if (last) {
+        let m = last.currentMode;
         if (m === "normal") m = "default";      // legacy (v0.x)
         if (m === "default") m = "ask";          // v1.0.0 → v2.0.0 rename
         if (m === "accept-edits") m = "ask";
-        if ((MODE_CYCLE as string[]).includes(m)) currentMode = m;
-        if (typeof last.data.planPhase === "string")
-          planPhase = last.data.planPhase as PlanPhase;
-        if (typeof last.data.planExecuting === "boolean")
-          planExecuting = last.data.planExecuting;
-        if (Array.isArray(last.data.planTodos))
-          planTodos = last.data.planTodos as TodoItem[];
-        if (typeof last.data.lastExtractedPlanHash === "string")
-          lastExtractedPlanHash = last.data.lastExtractedPlanHash;
-        if (typeof last.data.activeProfile === "string")
-          activeProfile = last.data.activeProfile;
+        if ((MODE_CYCLE as string[]).includes(m)) currentMode = m!;
+        if (typeof last.planPhase === "string")
+          planPhase = last.planPhase as PlanPhase;
+        if (typeof last.planExecuting === "boolean")
+          planExecuting = last.planExecuting;
+        if (Array.isArray(last.planTodos))
+          planTodos = last.planTodos as TodoItem[];
+        if (typeof last.lastExtractedPlanHash === "string")
+          lastExtractedPlanHash = last.lastExtractedPlanHash;
+        if (typeof last.activeProfile === "string")
+          activeProfile = last.activeProfile;
       }
     } catch {
       /* ignore */
@@ -2055,6 +2161,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
     // Always publish so nested / later spawns see the effective mode.
     publishInheritedPermissionMode(currentMode);
+    publishCapability({ mode: currentMode });
 
     classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
     autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
@@ -2064,7 +2171,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     reloadMergedPermissionRules(ctx.cwd);
 
     try {
-      gitBranch = (ctx.sessionManager as any).getGitBranch?.() ?? "";
+      gitBranch = readGitBranch(ctx.sessionManager) ?? "";
     } catch {
       /* ignore */
     }
@@ -2105,8 +2212,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     const title = name
       ? `[Subagent ${name}] ${request.message}`
       : `[Subagent] ${request.message}`;
-    const sessionId =
-      (ctx.sessionManager as { getSessionId?: () => string })?.getSessionId?.();
+    const sessionId = readSessionId(ctx.sessionManager);
     // Only the targeted parent session may answer; reject mismatched inbox drain.
     if (sessionId && sessionId !== request.targetSessionId) {
       forwardingClaimedIds.delete(request.id);
@@ -2133,45 +2239,18 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         decision = "allow_always_local";
         approved = true;
         denialReason = undefined;
-        const rule = suggestAllowRuleForToolCall(
-          request.tool,
-          request.input,
-          request.cwd,
-        );
-        if (
-          addPermissionRule({
-            rule,
-            behavior: "allow",
-            destination: "local",
-            cwd: request.cwd,
-          })
-        ) {
-          reloadMergedPermissionRules(ctx.cwd);
-          warnIfLocalPermissionsNotGitignored(request.cwd, (msg) =>
-            ctx.ui.notify(msg, "warning"),
-          );
-          ctx.ui.notify(`Added allow rule (project local): ${rule}`);
-        }
+        await applyApprovalDecision(ctx, request.tool, request.input, "allow_always_local", {
+          ruleCwd: request.cwd,
+          trackWrite: false,
+        });
       } else if (choice === "Allow always (global)") {
         decision = "allow_always_global";
         approved = true;
         denialReason = undefined;
-        const rule = suggestAllowRuleForToolCall(
-          request.tool,
-          request.input,
-          request.cwd,
-        );
-        if (
-          addPermissionRule({
-            rule,
-            behavior: "allow",
-            destination: "global",
-            cwd: request.cwd,
-          })
-        ) {
-          reloadMergedPermissionRules(ctx.cwd);
-          ctx.ui.notify(`Added allow rule (global): ${rule}`);
-        }
+        await applyApprovalDecision(ctx, request.tool, request.input, "allow_always_global", {
+          ruleCwd: request.cwd,
+          trackWrite: false,
+        });
       }
     } catch {
       decision = "block";
@@ -2201,8 +2280,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       hasUI: true,
       isChild: false,
       claimedIds: forwardingClaimedIds,
-      getSessionId: () =>
-        (ctx.sessionManager as { getSessionId?: () => string })?.getSessionId?.(),
+      getSessionId: () => readSessionId(ctx.sessionManager),
       onRequest: (request) => handleForwardedPermissionRequest(ctx, request),
     });
     forwardingPoller.start();
