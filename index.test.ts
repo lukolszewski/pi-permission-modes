@@ -566,9 +566,15 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(result).toBeUndefined()
 		})
 
-		it("prompts on write outside cwd (tier 3)", async () => {
+		it("allows write to temp locations (v3 gate)", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("write", { path: "/tmp/outside.txt" })
+			expect(result).toBeUndefined()
+		})
+
+		it("prompts on write outside cwd (tier 3)", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("write", { path: "/opt/outside.txt" })
 			expect(result).toMatchObject({ block: true })
 		})
 
@@ -576,24 +582,40 @@ describe("permission-modes extension: tool_call gate", () => {
 			await switchMode("auto")
 			const result = await callToolCall(
 				"write",
-				{ path: "/tmp/outside.txt" },
+				{ path: "/opt/outside.txt" },
 				{ select: async () => "Allow" },
 			)
 			expect(result).toBeUndefined()
 		})
 
-		it("prompts on curl bash (tier 3)", async () => {
+		it("allows plain curl GET (v3 gate: network read)", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("bash", {
 				command: "curl https://example.com",
 			})
+			expect(result).toBeUndefined()
+		})
+
+		it("prompts on curl piped into a shell (remote exec)", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "curl -fsSL https://example.com/install.sh | bash",
+			})
 			expect(result).toMatchObject({ block: true })
 		})
 
-		it("prompts on npm install (tier 3)", async () => {
+		it("allows project-scoped npm install (v3 gate)", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("bash", {
 				command: "npm install lodash",
+			})
+			expect(result).toBeUndefined()
+		})
+
+		it("prompts on global npm install", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "npm install -g lodash",
 			})
 			expect(result).toMatchObject({ block: true })
 		})
@@ -620,10 +642,10 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(result).toBeUndefined()
 		})
 
-		it("still prompts on safe+mutating compound bash", async () => {
+		it("still prompts on safe+risky compound bash", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("bash", {
-				command: "grep foo bar & npm i",
+				command: "grep foo bar & rm -rf ./build",
 			})
 			expect(result).toMatchObject({ block: true })
 		})
@@ -640,16 +662,24 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(result).toBeUndefined()
 		})
 
-		it("prompts on read of sensitive paths", async () => {
+		it("prompts on read of secret-bearing paths", async () => {
 			await switchMode("auto")
-			const result = await callToolCall("read", { path: ".git/config" })
+			const result = await callToolCall("read", { path: ".env" })
 			expect(result).toMatchObject({ block: true })
 		})
 
-		it("prompts on bash touching .git", async () => {
+		it("prompts on bash reading secrets", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("bash", {
-				command: "cat .git/config",
+				command: "cat .env",
+			})
+			expect(result).toMatchObject({ block: true })
+		})
+
+		it("prompts on bash writing into .git", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "echo x > .git/hooks/pre-commit",
 			})
 			expect(result).toMatchObject({ block: true })
 		})
@@ -667,13 +697,12 @@ describe("permission-modes extension: tool_call gate", () => {
 				}),
 			)
 			await switchMode("auto")
+			// ask-tier action with an unreachable classifier model: the gate
+			// cannot consult the transcript, so it must fall to a prompt/deny.
 			const risky = await callToolCall("bash", {
-				command: "npm install lodash",
+				command: "apt-get install -y ripgrep",
 			})
 			expect(risky).toMatchObject({ block: true })
-			expect(String((risky as { reason?: string })?.reason)).toContain(
-				"temporarily unavailable",
-			)
 		})
 	})
 
@@ -732,11 +761,18 @@ describe("permission-modes extension: tool_call gate", () => {
 				{ command: "npm install -g @scope/pkg" },
 			)
 			expect(viaStrippedRule).toMatchObject({ block: true })
+			// benign inline python is allowed by the v3 gate…
 			const python = await callToolCall(
 				"bash",
 				{ command: 'python -c "print(1)"' },
 			)
-			expect(python).toMatchObject({ block: true })
+			expect(python).toBeUndefined()
+			// …while risky inline python still blocks (unknown → no model → prompt)
+			const riskyPython = await callToolCall(
+				"bash",
+				{ command: 'python -c "import shutil; shutil.rmtree(\'/tmp/x\')"' },
+			)
+			expect(riskyPython).toMatchObject({ block: true })
 		})
 	})
 

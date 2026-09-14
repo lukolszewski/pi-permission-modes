@@ -19,10 +19,18 @@ export const CLASSIFIER_STAGE_SUFFIXES: readonly ClassifierStage[] = [
 	"thinking",
 ] as const
 
+export type ClassifierEngine = "gate" | "legacy"
+
 export interface ClassifierConfig {
 	enabled: boolean
 	model: string
 	timeoutMs: number
+	/** v3 deterministic-policy + narrow-model gate ("gate", default) or the CC-style single-shot classifier ("legacy"). */
+	engine?: ClassifierEngine
+	/** Direct OpenAI-compatible endpoint override (bypasses pi's model registry). */
+	baseUrl?: string
+	/** Model id sent to baseUrl (defaults to the id part of `model`). */
+	modelId?: string
 	/** CC-style JSONL transcript lines instead of "User:" / "bash cmd" format. */
 	jsonlTranscript?: boolean
 	/** When true (default), classifier errors deny the action instead of local fallback. */
@@ -61,6 +69,7 @@ const DEFAULT_CLASSIFIER: ClassifierConfig = {
 	failClosed: true,
 	stage: "tool",
 	includeAgentsMd: true,
+	engine: "gate",
 }
 
 export function resolveClassifierConfig(
@@ -71,6 +80,9 @@ export function resolveClassifierConfig(
 		enabled: c.enabled ?? DEFAULT_CLASSIFIER.enabled,
 		model: c.model ?? DEFAULT_CLASSIFIER.model,
 		timeoutMs: c.timeoutMs ?? DEFAULT_CLASSIFIER.timeoutMs,
+		engine: c.engine ?? DEFAULT_CLASSIFIER.engine,
+		baseUrl: c.baseUrl,
+		modelId: c.modelId,
 		jsonlTranscript: c.jsonlTranscript ?? false,
 		failClosed: c.failClosed ?? DEFAULT_CLASSIFIER.failClosed,
 		stage: c.stage ?? DEFAULT_CLASSIFIER.stage,

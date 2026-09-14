@@ -110,6 +110,14 @@ import {
 import {
   runPlanApprovalDialog,
 } from "./plan-approval-dialog.ts";
+import { runGate, type GateResult } from "./gate.ts";
+import { addGrant, createGrantStore } from "./session-grants.ts";
+import {
+	collectUserMessagesFromBranch,
+	gateDenialMessage,
+	gatePromptLabel,
+	resolveGateEndpoint,
+} from "./gate-bridge.ts";
 import {
   createForwardingPoller,
   defaultAgentDir,
@@ -203,6 +211,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   let strippedDangerousRules: PermissionRule[] = [];
   let mergedPermissionRules: PermissionRule[] = [];
   let classifierDenialState: DenialTrackingState = createDenialTrackingState();
+  const gateGrants = createGrantStore();
   const MAX_CLASSIFIER_FAILURES = 3;
   let forwardingPoller: ForwardingPoller | undefined;
   /** Survives poller restarts so the same inbox request is not double-prompted. */
@@ -520,6 +529,101 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
   function classifierDenyBlock(tool: string, reason: string): Block {
     return { block: true, reason: buildYoloRejectionMessage(reason) };
+  }
+
+  async function approveAutoWithGate(
+    ctx: ExtensionContext,
+    tool: string,
+    input: Record<string, unknown>,
+  ): Promise<Block | undefined> {
+    const debugOn = process.env.PERMISSION_MODES_CLASSIFIER_DEBUG === "1";
+    const endpoint = classifierConfig.enabled
+      ? await resolveGateEndpoint(classifierConfig, ctx.modelRegistry as any)
+      : undefined;
+    let branch: Array<{ type?: string; message?: { role?: string; content?: unknown } }> = [];
+    try {
+      branch = (ctx.sessionManager as any).getBranch?.() ?? [];
+    } catch {
+      // gate still runs on the pending action alone
+    }
+    const userMessages = collectUserMessagesFromBranch(branch);
+    let r: GateResult;
+    try {
+      r = await runGate(tool, input, {
+        policy: { cwd: ctx.cwd, project: ctx.cwd, home: homedir() },
+        endpoint,
+        grants: gateGrants,
+        userMessages,
+        signal: ctx.signal,
+        debug: debugOn ? (l) => console.debug("[permission-modes]", l) : undefined,
+      });
+    } catch (err) {
+      return promptAutoTier3(
+        ctx,
+        tool,
+        input,
+        `gate error: ${err instanceof Error ? err.message : String(err)}`,
+        "gate-error",
+      );
+    }
+    if (r.outcome === "allow" || r.outcome === "allow-granted") {
+      classifierDenialState = recordClassifierSuccess(classifierDenialState);
+      if (debugOn && r.grantedBy) {
+        console.debug(`[permission-modes] gate allow (${r.grantedBy}): ${r.reason}`);
+      }
+      return finishAutoTier3Allow(ctx, tool, input);
+    }
+    return promptGateApproval(ctx, tool, input, r);
+  }
+
+  async function promptGateApproval(
+    ctx: ExtensionContext,
+    tool: string,
+    input: Record<string, unknown>,
+    r: GateResult,
+  ): Promise<Block | undefined> {
+    const label = gatePromptLabel(r);
+    if (!ctx.hasUI) {
+      if (r.tier === "never") {
+        pendingComplianceInject = true;
+        complianceCategory = r.category;
+        return { block: true, reason: gateDenialMessage(r) };
+      }
+      return promptWithPermissionOptions(ctx, tool, input, label, r.category);
+    }
+    const targets = r.entities.filter((e) => e.kind === "target").map((e) => e.value);
+    const scopes = r.entities.filter((e) => e.kind === "scope").map((e) => e.value);
+    const sessionEntityOption = targets.length
+      ? `Allow for session: ${targets.slice(0, 3).join(", ")}${targets.length > 3 ? ", …" : ""}`
+      : undefined;
+    const sessionScopeOption = scopes.length
+      ? `Allow for session (scope ${scopes[0]})`
+      : undefined;
+    const options: string[] = ["Allow"];
+    if (r.tier !== "never") {
+      if (sessionEntityOption) options.push(sessionEntityOption);
+      if (sessionScopeOption) options.push(sessionScopeOption);
+      options.push("Allow always (this project)", "Allow always (global)");
+    }
+    options.push("Block");
+    const choice = await ctx.ui.select(`Allow ${tool}? ${label}`, options);
+    if (choice === undefined || choice === "Block") {
+      classifierDenialState = recordClassifierDenial(classifierDenialState);
+      pendingComplianceInject = true;
+      complianceCategory = r.category;
+      return { block: true, reason: gateDenialMessage(r) };
+    }
+    if (sessionEntityOption && choice === sessionEntityOption) {
+      for (const t of targets) addGrant(gateGrants, r.category, t, "entity");
+    } else if (sessionScopeOption && choice === sessionScopeOption) {
+      for (const sc of scopes) addGrant(gateGrants, r.category, sc, "scope");
+    } else if (choice === "Allow always (this project)") {
+      return applyApprovalDecision(ctx, tool, input, "allow_always_local", { category: r.category });
+    } else if (choice === "Allow always (global)") {
+      return applyApprovalDecision(ctx, tool, input, "allow_always_global", { category: r.category });
+    }
+    classifierDenialState = recordClassifierSuccess(classifierDenialState);
+    return finishAutoTier3Allow(ctx, tool, input);
   }
 
   async function approveAutoTier3(
@@ -1685,6 +1789,27 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
     // AUTO: tiered gate with optional classifier + user prompts for risky ops
     if (currentMode === "auto") {
+      if (classifierConfig.engine !== "legacy") {
+        // v3 gate: deterministic policy first, then narrow model tasks.
+        // User-configured autoMode rules still short-circuit ahead of it.
+        if (tool === "bash") {
+          const cmd = String(input.command ?? "");
+          if (cmd && autoModeConfig?.allow?.length) {
+            if (
+              autoModeConfig.allow.some((p) => matchAutoModePattern(cmd, p)) &&
+              classifyBashTiers(cmd).autoApprovable
+            ) {
+              return allowToolCall();
+            }
+          }
+          if (cmd && autoModeConfig?.soft_deny?.length) {
+            if (autoModeConfig.soft_deny.some((p) => matchAutoModePattern(cmd, p))) {
+              return promptAutoTier3(ctx, tool, input, "matched autoMode.soft_deny", "auto-deny");
+            }
+          }
+        }
+        return approveAutoWithGate(ctx, tool, input);
+      }
       if (tool === "read" || tool === "grep" || tool === "find" || tool === "ls") {
         const pathStr = String(input.path ?? "");
         if (pathStr && isSensitivePath(pathStr, ctx.cwd)) {
