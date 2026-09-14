@@ -39,7 +39,52 @@ When permission-modes would prompt and `!ctx.hasUI`:
 
 The interactive session writes `PERMISSION_MODES_INHERITED_MODE` (`ask` | `plan` | `auto` | `bypass`) into the process environment whenever the mode changes (and again on each `before_agent_start`). pi-subagents merges `process.env` into child spawns (and passes `--permission-mode` when that env is set), so headless children start in the **same mode** as the parent (e.g. parent bypass → child auto-approves; no approval popups).
 
-### Auto classifier (optional)
+### Auto-mode gate (v3, default engine)
+
+Auto mode routes every tool call through a three-layer gate (spec: [docs/CLASSIFIER-SPEC.md](docs/CLASSIFIER-SPEC.md)):
+
+1. **Deterministic policy** (`risk-policy.ts`) — a real shell lexer plus per-verb risk
+   tables decide most calls in code: reads, project writes, builds/tests, local git → **allow**;
+   recursive deletes, sudo, system packages, pushes, listeners, uploads, cluster/db mutations
+   → **ask** (entity-scoped); wiping protected paths, disk/device writes, reboot, firewall
+   teardown, credential exfiltration, `DROP DATABASE`… → **never** (not pre-authorisable, loud
+   prompt or denial). On the recorded real-session corpus ~75 % of calls resolve here with zero
+   model involvement.
+2. **Authorisation** for *ask* — permission rules, then prompt-once **session grants**
+   (`{category, entity}`; approving `docker rmi api:dev` never covers `payments:prod`), then
+   **transcript authorisation**: a small model extracts what the user allowed/forbade
+   (`response_format: json_schema`, temp 0, ≤300 tokens) and code verifies it — verbatim quote,
+   whole-token entity match (`db-backup` ≠ `db-backup-test`), forbidden-target veto, revocation.
+   The model can only narrow a decision, never widen it.
+3. **Effect classification** for commands the tables cannot read (inline `python -c`,
+   unknown binaries): same schema-constrained call, mapped back onto the tiers.
+
+A parse failure is structurally impossible (`json_schema`), any transport failure falls
+closed to a prompt, and verdicts are reproducible across server restarts (measured 0 flips).
+Works well with a self-hosted **Qwen3.5-4B** (~2 GB VRAM, ~370 ms p50/call — see
+`docs/GATE-RESULTS.md`); quality ceiling reached from 9B upward.
+
+```json
+{
+  "classifier": {
+    "enabled": true,
+    "model": "litellm/qwen3.8-27b",
+    "baseUrl": "http://127.0.0.1:8014/v1",
+    "modelId": "clf-qwen35-4b",
+    "timeoutMs": 15000,
+    "engine": "gate"
+  }
+}
+```
+
+- `engine`: `"gate"` (default) or `"legacy"` (the CC-style single-shot classifier below).
+- `baseUrl`/`modelId`: direct OpenAI-compatible endpoint (needs `response_format: json_schema`
+  support — llama.cpp, vLLM, litellm). Without them the endpoint is resolved from `model`
+  via pi's model registry.
+- With the classifier disabled or unreachable the gate still runs: *allow*-tier proceeds,
+  everything else prompts (UI) or is denied with the reason (headless). Fail-closed, never open.
+
+### Legacy auto classifier (`engine: "legacy"`)
 
 Configure `~/.pi/agent/permission-modes.json`:
 
@@ -47,6 +92,7 @@ Configure `~/.pi/agent/permission-modes.json`:
 {
   "classifier": {
     "enabled": false,
+    "engine": "legacy",
     "model": "anthropic/claude-haiku-4-5",
     "timeoutMs": 8000
   }
