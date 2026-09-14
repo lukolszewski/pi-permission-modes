@@ -85,7 +85,6 @@ import {
   formatCount,
   getPlanFilePath,
   hashPlan,
-  injectModePrompt,
   isAutoFallbackBash,
   classifyBashTiers,
   isOutsideCwd,
@@ -212,6 +211,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   let mergedPermissionRules: PermissionRule[] = [];
   let classifierDenialState: DenialTrackingState = createDenialTrackingState();
   const gateGrants = createGrantStore();
+  /** Mode banner + one-shot notices for the current turn, appended as a
+   *  trailing context message instead of mutating the system prompt. */
+  let tailBannerText = "";
   const MAX_CLASSIFIER_FAILURES = 3;
   let forwardingPoller: ForwardingPoller | undefined;
   /** Survives poller restarts so the same inbox request is not double-prompted. */
@@ -1945,6 +1947,26 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   });
 
   // ---- context injection (system prompt anchor) --------------------------
+  // Appends the per-turn permission-modes notice as the LAST message of every
+  // LLM call (pi converts role "custom" to a user message). Transient: the
+  // message is not persisted to the session, and the classifier transcript
+  // builder never sees it. Keeping it at the tail preserves the KV cache for
+  // the whole conversation prefix.
+  pi.on("context", async (event) => {
+    if (!tailBannerText) return undefined;
+    const messages = [
+      ...(event.messages ?? []),
+      {
+        role: "custom" as const,
+        customType: "permission-modes-notice",
+        content: `<permission-mode>\n${tailBannerText}\n</permission-mode>`,
+        display: false,
+        timestamp: Date.now(),
+      },
+    ];
+    return { messages };
+  });
+
   pi.on("before_agent_start", async (event, ctx) => {
     // Keep inherited-mode env fresh so subagents spawned this turn see the
     // parent's current mode (covers mid-session upgrades / missed setMode).
@@ -2037,15 +2059,22 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       }
     }
 
-    const anchored = injectModePrompt(workingPrompt, modeBlock);
-    const withInjection =
-      injectionBlock && anchored
-        ? `${anchored}\n\n${injectionBlock}`
-        : injectionBlock && !anchored
-          ? injectionBlock
-          : anchored;
-    if (withInjection !== workingPrompt || modeBlock || injectionBlock) {
-      return { systemPrompt: withInjection || workingPrompt };
+    // KV-cache-friendly banner delivery (stable-prompt): the system prompt is
+    // left byte-identical across turns — the mode banner, one-shot notices and
+    // the injection warning are stashed here and appended by the "context"
+    // handler as a trailing message on every LLM call this turn. Any change to
+    // the leading system prompt invalidates the server's KV cache for the
+    // entire conversation (~180k tokens re-prefilled); a trailing message
+    // costs only its own tokens. See docs/STABLE-PROMPT.md.
+    tailBannerText = [modeBlock.trim(), injectionBlock.trim()]
+      .filter(Boolean)
+      .join("\n\n");
+
+    // The only remaining head mutation is per-mode skill filtering, which is
+    // a no-op unless the user configured mode-specific skills (and then only
+    // changes on an actual mode switch).
+    if (workingPrompt !== systemPromptBase) {
+      return { systemPrompt: workingPrompt };
     }
     return undefined;
   });

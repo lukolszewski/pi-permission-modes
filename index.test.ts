@@ -1623,6 +1623,18 @@ describe("skill filtering in before_agent_start", () => {
 		return result as { message?: unknown; systemPrompt?: string } | undefined
 	}
 
+	/** Run the "context" handler and return the appended trailing notice, if any. */
+	async function contextTail(): Promise<string | undefined> {
+		const handlers = pi.handlers.get("context") ?? []
+		if (handlers.length === 0) return undefined
+		const result = (await handlers[0]!(
+			{ type: "context", messages: [] } as never,
+			makeCtx(pi, { cwd: realProjectRoot }),
+		)) as { messages?: Array<{ content?: string }> } | undefined
+		const last = result?.messages?.[result.messages.length - 1]
+		return typeof last?.content === "string" ? last.content : undefined
+	}
+
 	beforeEach(() => {
 		tmpDir = mkdtempSync(join(tmpdir(), "pm-skf-"))
 		pi = createFakePi()
@@ -1645,10 +1657,10 @@ describe("skill filtering in before_agent_start", () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		const prompt = skillPrompt(["brainstorming", "systematic-debugging"])
 		const result = await triggerBeforeAgentStart(prompt, "ask")
-		// Skills unchanged; ask mode injects one-line reminder anchor
-		expect(result?.systemPrompt).toContain("brainstorming")
-		expect(result?.systemPrompt).toContain("systematic-debugging")
-		expect(result?.systemPrompt).toContain("[Ask]")
+		// Stable-prompt: no filter and no banner in the head → prompt untouched.
+		expect(result?.systemPrompt).toBeUndefined()
+		// The ask reminder is delivered as a trailing context message instead.
+		expect(await contextTail()).toContain("[Ask]")
 	})
 
 	it("filters skills when a mode-specific skill filter is active", async () => {
@@ -1684,17 +1696,21 @@ describe("skill filtering in before_agent_start", () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		const prompt = skillPrompt(["brainstorming", "systematic-debugging"])
 		const result = await triggerBeforeAgentStart(prompt, "plan")
-		// Skills unchanged; plan mode anchor still injected via systemPrompt
-		expect(result?.systemPrompt).toContain("brainstorming")
-		expect(result?.systemPrompt).toContain("systematic-debugging")
-		expect(result?.systemPrompt).toContain("permission-modes:context")
+		// Stable-prompt: filter is a no-op → prompt untouched; plan protocol
+		// arrives via the trailing context message.
+		expect(result?.systemPrompt).toBeUndefined()
+		expect(await contextTail()).toContain("[Plan Mode]")
 	})
 
 	it("injects bypass security reminder on session start", async () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		const result = await triggerBeforeAgentStart("base prompt", "bypass")
-		expect(result?.systemPrompt).toContain("[Bypass]")
-		expect(result!.systemPrompt).toContain("auto-approved")
+		// Stable-prompt: the security reminder is a trailing message, not a
+		// system-prompt mutation.
+		expect(result?.systemPrompt).toBeUndefined()
+		const tail = await contextTail()
+		expect(tail).toContain("[Bypass]")
+		expect(tail).toContain("auto-approved")
 	})
 
 	it("injects plan anchor in system prompt with skill filtering", async () => {
@@ -1712,10 +1728,13 @@ describe("skill filtering in before_agent_start", () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		const prompt = skillPrompt(["brainstorming", "systematic-debugging"])
 		const result = await triggerBeforeAgentStart(prompt, "plan")
+		// Skill filtering still rewrites the prompt (only on a real filter)…
 		expect(result?.systemPrompt).toBeDefined()
 		expect(result!.systemPrompt).toContain("brainstorming")
 		expect(result!.systemPrompt).not.toContain("systematic-debugging")
-		expect(result!.systemPrompt).toContain("[Plan Mode]")
+		// …but the mode banner is no longer in the head.
+		expect(result!.systemPrompt).not.toContain("[Plan Mode]")
+		expect(await contextTail()).toContain("[Plan Mode]")
 		expect(result?.message).toBeUndefined()
 	})
 
@@ -1734,10 +1753,8 @@ describe("skill filtering in before_agent_start", () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		const prompt = skillPrompt(["brainstorming", "systematic-debugging"])
 		const result = await triggerBeforeAgentStart(prompt, "plan")
-		// systemPrompt should contain the original skills (filter is a no-op)
-		expect(result?.systemPrompt).toBeDefined()
-		expect(result!.systemPrompt).toContain("brainstorming")
-		expect(result!.systemPrompt).toContain("systematic-debugging")
+		// Filter is a no-op → stable prompt, nothing returned for the head.
+		expect(result?.systemPrompt).toBeUndefined()
 	})
 
 	it("filters skills only for the mode the filter is configured on", async () => {
@@ -1753,9 +1770,9 @@ describe("skill filtering in before_agent_start", () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		const prompt = skillPrompt(["brainstorming", "systematic-debugging"])
 		const askResult = await triggerBeforeAgentStart(prompt, "ask")
-		// ask mode has no skill filter; skills preserved + ask anchor
-		expect(askResult?.systemPrompt).toContain("systematic-debugging")
-		expect(askResult?.systemPrompt).toContain("[Ask]")
+		// ask mode has no skill filter → prompt untouched; reminder in the tail
+		expect(askResult?.systemPrompt).toBeUndefined()
+		expect(await contextTail()).toContain("[Ask]")
 	})
 
 	it("applies skill filter from active profile (not default profile)", async () => {
@@ -2014,6 +2031,102 @@ describe("permission-modes: subagent inherits parent mode", () => {
 	})
 })
 
+// ---- Stable system prompt (KV-cache friendliness) -----------------------
+
+describe("stable system prompt across turns", () => {
+	let pi: FakePi
+	let configTmp: string
+	const realProjectRoot = process.cwd()
+
+	beforeEach(async () => {
+		pi = createFakePi()
+		configTmp = mkdtempSync(join(tmpdir(), "pm-idx-stable-"))
+		setConfigPath(join(configTmp, "permission-modes.json"))
+		writeFileSync(
+			join(configTmp, "permission-modes.json"),
+			JSON.stringify({ classifier: { enabled: false } }),
+		)
+		permissionModesExtension(makeFakePiForExtension(pi))
+	})
+
+	afterEach(() => {
+		rmSync(configTmp, { recursive: true, force: true })
+	})
+
+	async function startTurn(mode?: string): Promise<{ systemPrompt?: string } | undefined> {
+		if (mode) {
+			const cmds = pi.commands.get(mode)
+			if (cmds) await cmds({ args: "" }, makeCtx(pi, { cwd: realProjectRoot }))
+		}
+		const handlers = pi.handlers.get("before_agent_start") ?? []
+		return (await handlers[0]!(
+			{ systemPrompt: "BASE PROMPT" } as never,
+			makeCtx(pi, { cwd: realProjectRoot, ui: {} }),
+		)) as { systemPrompt?: string } | undefined
+	}
+
+	async function tail(): Promise<string | undefined> {
+		const handlers = pi.handlers.get("context") ?? []
+		const result = (await handlers[0]!(
+			{ type: "context", messages: [{ role: "user", content: "hi" }] } as never,
+			makeCtx(pi, { cwd: realProjectRoot }),
+		)) as { messages?: Array<{ role?: string; content?: string }> } | undefined
+		if (!result?.messages) return undefined
+		const last = result.messages[result.messages.length - 1]
+		return typeof last?.content === "string" ? last.content : undefined
+	}
+
+	it("never rewrites the system prompt across turns and mode switches", async () => {
+		pi.flags["permission-mode"] = "ask"
+		await pi.simulateSessionStart(realProjectRoot)
+		// several turns incl. mode switches: the head must stay untouched
+		expect((await startTurn())?.systemPrompt).toBeUndefined()
+		expect((await startTurn("auto"))?.systemPrompt).toBeUndefined()
+		expect((await startTurn("plan"))?.systemPrompt).toBeUndefined()
+		expect((await startTurn("ask"))?.systemPrompt).toBeUndefined()
+	})
+
+	it("appends the notice as the LAST message and preserves existing ones", async () => {
+		pi.flags["permission-mode"] = "bypass"
+		await pi.simulateSessionStart(realProjectRoot)
+		await startTurn()
+		const handlers = pi.handlers.get("context") ?? []
+		const result = (await handlers[0]!(
+			{ type: "context", messages: [{ role: "user", content: "hi" }] } as never,
+			makeCtx(pi, { cwd: realProjectRoot }),
+		)) as { messages: Array<{ role?: string; customType?: string; display?: boolean }> }
+		expect(result.messages).toHaveLength(2)
+		expect(result.messages[0]).toMatchObject({ role: "user" })
+		expect(result.messages[1]).toMatchObject({
+			role: "custom",
+			customType: "permission-modes-notice",
+			display: false,
+		})
+	})
+
+	it("one-shot reminders appear once, then the tail goes quiet (ask)", async () => {
+		pi.flags["permission-mode"] = "ask"
+		await pi.simulateSessionStart(realProjectRoot)
+		await startTurn()
+		const first = await tail()
+		expect(first).toContain("[Ask]")
+		await startTurn()
+		// reminder consumed → no trailing message at all on the next turn
+		expect(await tail()).toBeUndefined()
+	})
+
+	it("auto mode tail carries the injection warning and is stable turn-to-turn", async () => {
+		pi.flags["permission-mode"] = "auto"
+		await pi.simulateSessionStart(realProjectRoot)
+		await startTurn()
+		const t1 = await tail()
+		await startTurn()
+		const t2 = await tail()
+		expect(t1).toContain("Tool results may include data")
+		expect(t2).toBe(t1)
+	})
+})
+
 // ---- Injection probe in before_agent_start (plan B1) --------------------
 // Real SessionEntry shape: {type:"message", message:{role:"user"|"assistant"|"toolResult"}}.
 describe("injection probe in before_agent_start (plan B1)", () => {
@@ -2047,7 +2160,17 @@ describe("injection probe in before_agent_start (plan B1)", () => {
 			{ systemPrompt: "BASE PROMPT" } as never,
 			makeCtx(pi, { cwd: realProjectRoot, ui: {}, sessionManager }),
 		)) as { systemPrompt?: string } | undefined
-		return result?.systemPrompt ?? ""
+		// Stable-prompt: the head must never change from banner content.
+		expect(result?.systemPrompt).toBeUndefined()
+		// The warning is delivered via the trailing context message.
+		const ctxHandlers = pi.handlers.get("context") ?? []
+		expect(ctxHandlers.length).toBeGreaterThan(0)
+		const ctxResult = (await ctxHandlers[0]!(
+			{ type: "context", messages: [] } as never,
+			makeCtx(pi, { cwd: realProjectRoot, ui: {}, sessionManager }),
+		)) as { messages?: Array<{ content?: string }> } | undefined
+		const last = ctxResult?.messages?.[ctxResult.messages.length - 1]
+		return typeof last?.content === "string" ? last.content : ""
 	}
 
 	it("flags the specific signal when a toolResult entry carries an injection payload", async () => {
