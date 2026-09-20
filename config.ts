@@ -54,6 +54,14 @@ export interface PermissionModesConfig {
 		deny?: string[]
 		ask?: string[]
 	}
+	/** Inject the tool-output prompt-injection warning (auto/bypass modes).
+	 *  Default true; false disables both the standing note and the
+	 *  heuristic-triggered strong warning. */
+	injectionWarning?: boolean
+}
+
+export function resolveInjectionWarning(config: PermissionModesConfig): boolean {
+	return config.injectionWarning ?? true
 }
 
 let _configPath = join(homedir(), ".pi", "agent", "permission-modes.json")

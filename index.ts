@@ -34,6 +34,7 @@ import {
   loadPermissionModesConfig,
   resolveAutoModeConfig,
   resolveClassifierConfig,
+  resolveInjectionWarning,
 } from "./config.ts";
 import {
   restoreDangerousPermissionRules,
@@ -214,6 +215,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   let projectRoot: string | null = null;
   let classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
   let autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
+  let injectionWarningEnabled = resolveInjectionWarning(loadPermissionModesConfig());
   let basePermissionRules: PermissionRule[] = [];
   let strippedDangerousRules: PermissionRule[] = [];
   let mergedPermissionRules: PermissionRule[] = [];
@@ -2152,6 +2154,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
     classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
     autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
+    injectionWarningEnabled = resolveInjectionWarning(loadPermissionModesConfig());
     reloadMergedPermissionRules(ctx.cwd);
 
     const systemPromptBase =
@@ -2196,7 +2199,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     if (needsBypassSecurityReminder) needsBypassSecurityReminder = false;
 
     let injectionBlock = "";
-    if (currentMode === "auto" || currentMode === "bypass") {
+    if (injectionWarningEnabled && (currentMode === "auto" || currentMode === "bypass")) {
       injectionBlock = TOOL_OUTPUT_INJECTION_WARNING;
       try {
         // Real SessionEntry shape comes unwrapped from the port; the legacy
@@ -2518,6 +2521,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
     classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
     autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
+    injectionWarningEnabled = resolveInjectionWarning(loadPermissionModesConfig());
     if (currentMode === "auto") {
       classifierDenialState = createDenialTrackingState();
     }

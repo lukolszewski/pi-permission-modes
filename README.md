@@ -92,6 +92,10 @@ Works well with a self-hosted **Qwen3.5-4B** (~2 GB VRAM, ~370 ms p50/call — s
 - `ledger`: `false` disables the authorisation ledger (whole-session grant memory);
   `ledgerBackfillLimit` caps how many of the newest user messages are ever extracted
   (default 400).
+- Top-level `"injectionWarning": false` (next to `classifier`) disables the tool-output
+  prompt-injection note injected in auto/bypass modes (both the standing reminder and the
+  heuristic-triggered strong warning). Default on; the note tells the model to stay
+  silent unless it actually suspects an injection.
 - With the classifier disabled or unreachable the gate still runs: *allow*-tier proceeds,
   everything else prompts (UI) or is denied with the reason (headless). Fail-closed, never open.
 
