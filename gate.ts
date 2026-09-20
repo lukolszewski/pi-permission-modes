@@ -20,7 +20,8 @@ import {
 	type ModelCallResult,
 	type ModelEndpoint,
 } from "./model-client.ts"
-import { grantsCover, type GrantStore } from "./session-grants.ts"
+import { addGrant, grantsCover, type GrantStore } from "./session-grants.ts"
+import { ledgerCovers, type Ledger } from "./auth-ledger.ts"
 
 export type GateOutcome =
 	| "allow"            // run it, no user involvement
@@ -36,7 +37,7 @@ export type GateResult = {
 	/** Why (for the prompt / denial message / log). */
 	reason: string
 	/** Grant source when outcome is allow-granted. */
-	grantedBy?: "session-grant" | "transcript"
+	grantedBy?: "session-grant" | "ledger" | "transcript"
 	policy: PolicyDecision
 	modelCalls: Array<{ task: "grant" | "effect"; ms: number; ok: boolean; error?: string; raw?: string }>
 }
@@ -45,14 +46,18 @@ export type GateOptions = {
 	policy: PolicyOptions
 	endpoint?: ModelEndpoint
 	grants?: GrantStore
+	/** Authorisation ledger (kept in sync by the caller via syncLedger). */
+	ledger?: Ledger
 	/** Recent user messages, oldest first (already redacted/limited by caller). */
 	userMessages?: string[]
 	signal?: AbortSignal
 	debug?: (line: string) => void
 }
 
-const MAX_USER_MSGS = 40
-const MAX_USER_CHARS = 6000
+// Recent-window fallback only — long-range authorisation lives in the ledger,
+// so the window no longer has to carry the whole session (it can't anyway).
+const MAX_USER_MSGS = 60
+const MAX_USER_CHARS = 15000
 
 export function limitUserMessages(msgs: string[]): string[] {
 	let out = msgs.slice(-MAX_USER_MSGS)
@@ -120,6 +125,25 @@ export async function runGate(tool: string, input: Record<string, unknown>, opts
 		}
 	}
 
+	// ---- ASK: authorisation ledger (whole-session memory, pure code)
+	if (opts.ledger) {
+		const lv = ledgerCovers(opts.ledger, policy.category, policy.entities)
+		if (lv.covered) {
+			dbg(`[gate] ledger covers: ${lv.reason}`)
+			// promote to a session grant so repeats skip even the ledger scan
+			if (opts.grants) {
+				for (const m of lv.by) addGrant(opts.grants, policy.category, m.entity, "entity")
+			}
+			return finish("allow-granted", "ask", policy, lv.reason, modelCalls, "ledger")
+		}
+		if (lv.forbidden) {
+			// an explicit revocation outrules the recent-window fallback: a stale
+			// grant still inside the window must not overrule "stop doing X"
+			dbg(`[gate] ledger forbids: ${lv.reason}`)
+			return finish("prompt", "ask", policy, lv.reason, modelCalls)
+		}
+	}
+
 	// ---- ASK: transcript authorisation
 	const userMessages = limitUserMessages(opts.userMessages ?? [])
 	if (opts.endpoint && userMessages.length > 0) {
@@ -139,6 +163,10 @@ export async function runGate(tool: string, input: Record<string, unknown>, opts
 			const verdict = verifyGrant({ extraction: res.value, category: policy.category, entities: policy.entities, userMessages })
 			dbg(`[gate] grant: model=${res.value.authorized} verified=${verdict.granted} — ${verdict.reason}`)
 			if (verdict.granted) {
+				// persist so the identical action does not re-pay the model call
+				if (opts.grants) {
+					for (const m of verdict.matches) addGrant(opts.grants, policy.category, m.entity, "entity")
+				}
 				return finish("allow-granted", "ask", policy, verdict.reason, modelCalls, "transcript")
 			}
 			return finish("prompt", "ask", policy, verdict.reason, modelCalls)

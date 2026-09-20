@@ -110,13 +110,21 @@ import {
   runPlanApprovalDialog,
 } from "./plan-approval-dialog.ts";
 import { runGate, type GateResult } from "./gate.ts";
-import { addGrant, createGrantStore } from "./session-grants.ts";
+import { addGrant, createGrantStore, type SessionGrant } from "./session-grants.ts";
 import {
 	collectUserMessagesFromBranch,
+	collectUserMessageRefs,
 	gateDenialMessage,
 	gatePromptLabel,
 	resolveGateEndpoint,
+	syncLedger,
 } from "./gate-bridge.ts";
+import {
+	createLedger,
+	deserializeLedger,
+	serializeLedger,
+} from "./auth-ledger.ts";
+import type { ModelEndpoint } from "./model-client.ts";
 import {
   createForwardingPoller,
   defaultAgentDir,
@@ -211,6 +219,11 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   let mergedPermissionRules: PermissionRule[] = [];
   let classifierDenialState: DenialTrackingState = createDenialTrackingState();
   const gateGrants = createGrantStore();
+  let gateLedger = createLedger();
+  /** Throttle: background backfill pauses while a live gate call is in flight. */
+  let gateCallInFlight = false;
+  let ledgerBackfillActive = false;
+  let ledgerPersistTimer: ReturnType<typeof setTimeout> | undefined;
   /** Mode banner + one-shot notices for the current turn, appended as a
    *  trailing context message instead of mutating the system prompt. */
   let tailBannerText = "";
@@ -533,6 +546,79 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     return { block: true, reason: buildYoloRejectionMessage(reason) };
   }
 
+  /** Debounced snapshot of ledger + session grants into the session file.
+   *  Losing one is only an optimization loss: temp-0 extraction rebuilds the
+   *  ledger deterministically via backfill (proper-permission-ledger.md §2.6). */
+  function writeLedgerSnapshot(): void {
+    try {
+      pi.appendEntry("gate-ledger", {
+        v: 1,
+        ledger: serializeLedger(gateLedger),
+        grants: gateGrants.grants,
+      });
+    } catch {
+      /* snapshot loss is recoverable — see above */
+    }
+  }
+
+  function scheduleLedgerPersist(): void {
+    if (ledgerPersistTimer) clearTimeout(ledgerPersistTimer);
+    ledgerPersistTimer = setTimeout(() => {
+      ledgerPersistTimer = undefined;
+      writeLedgerSnapshot();
+    }, 2000);
+    (ledgerPersistTimer as { unref?: () => void }).unref?.();
+  }
+
+  /** The debounce timer is unref'd (must not keep pi alive), so a headless -p
+   *  run can exit before it fires — flush pending snapshots at turn end. */
+  function flushLedgerPersist(): void {
+    if (!ledgerPersistTimer) return;
+    clearTimeout(ledgerPersistTimer);
+    ledgerPersistTimer = undefined;
+    writeLedgerSnapshot();
+  }
+
+  /** Drain unseen user messages into the ledger in the background, newest-first.
+   *  Yields to live gate calls; stops when done, on repeated failure, or when a
+   *  new session starts. Restarted lazily by the next gate invocation. */
+  function startLedgerBackfill(ctx: ExtensionContext, endpoint: ModelEndpoint): void {
+    if (ledgerBackfillActive) return;
+    ledgerBackfillActive = true;
+    const debugOn = process.env.PERMISSION_MODES_CLASSIFIER_DEBUG === "1";
+    const myLedger = gateLedger;
+    void (async () => {
+      try {
+        let prevPending = Infinity;
+        for (;;) {
+          if (gateLedger !== myLedger) return; // session changed / cleared
+          if (gateCallInFlight) {
+            await new Promise((res) => setTimeout(res, 300));
+            continue;
+          }
+          const refs = collectUserMessageRefs(readBranchEntries(ctx.sessionManager) as never);
+          const sync = await syncLedger({
+            refs,
+            ledger: myLedger,
+            endpoint,
+            maxCalls: 4,
+            backfillLimit: classifierConfig.ledgerBackfillLimit,
+            debug: debugOn ? (l) => console.debug("[permission-modes]", l) : undefined,
+          });
+          if (sync.changed) scheduleLedgerPersist();
+          if (sync.pending === 0) return;
+          if (sync.pending >= prevPending) return; // extraction failing — retry on next gate call
+          prevPending = sync.pending;
+          await new Promise((res) => setTimeout(res, 150));
+        }
+      } catch {
+        /* fail-safe: unprocessed messages fall back to the prompt path */
+      } finally {
+        ledgerBackfillActive = false;
+      }
+    })();
+  }
+
   async function approveAutoWithGate(
     ctx: ExtensionContext,
     tool: string,
@@ -549,29 +635,61 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       // gate still runs on the pending action alone
     }
     const userMessages = collectUserMessagesFromBranch(branch);
+    const ledgerOn = classifierConfig.ledger !== false;
+    gateCallInFlight = true;
     let r: GateResult;
     try {
-      r = await runGate(tool, input, {
-        policy: { cwd: ctx.cwd, project: ctx.cwd, home: homedir() },
-        endpoint,
-        grants: gateGrants,
-        userMessages,
-        signal: ctx.signal,
-        debug: debugOn ? (l) => console.debug("[permission-modes]", l) : undefined,
-      });
-    } catch (err) {
-      return promptAutoTier3(
-        ctx,
-        tool,
-        input,
-        `gate error: ${err instanceof Error ? err.message : String(err)}`,
-        "gate-error",
-      );
+      // Fold the newest unseen user messages into the ledger (≤2 calls inline,
+      // typically 1: the message that started this turn). Larger backlogs —
+      // resumed pre-plugin sessions, restarts without a snapshot — drain in the
+      // background without blocking this tool call.
+      if (endpoint && ledgerOn) {
+        try {
+          const sync = await syncLedger({
+            refs: collectUserMessageRefs(branch as never),
+            ledger: gateLedger,
+            endpoint,
+            maxCalls: 2,
+            backfillLimit: classifierConfig.ledgerBackfillLimit,
+            signal: ctx.signal,
+            debug: debugOn ? (l) => console.debug("[permission-modes]", l) : undefined,
+          });
+          if (sync.changed) scheduleLedgerPersist();
+          if (sync.pending > 0) startLedgerBackfill(ctx, endpoint);
+        } catch {
+          /* ledger sync must never block the gate; fallback paths cover it */
+        }
+      }
+      try {
+        r = await runGate(tool, input, {
+          policy: { cwd: ctx.cwd, project: ctx.cwd, home: homedir() },
+          endpoint,
+          grants: gateGrants,
+          ledger: ledgerOn ? gateLedger : undefined,
+          userMessages,
+          signal: ctx.signal,
+          debug: debugOn ? (l) => console.debug("[permission-modes]", l) : undefined,
+        });
+      } catch (err) {
+        return promptAutoTier3(
+          ctx,
+          tool,
+          input,
+          `gate error: ${err instanceof Error ? err.message : String(err)}`,
+          "gate-error",
+        );
+      }
+    } finally {
+      gateCallInFlight = false;
     }
     if (r.outcome === "allow" || r.outcome === "allow-granted") {
       classifierDenialState = recordClassifierSuccess(classifierDenialState);
-      if (debugOn && r.grantedBy) {
-        console.debug(`[permission-modes] gate allow (${r.grantedBy}): ${r.reason}`);
+      if (r.grantedBy) {
+        // runGate promoted ledger/transcript grants into the session store
+        scheduleLedgerPersist();
+        if (debugOn) {
+          console.debug(`[permission-modes] gate allow (${r.grantedBy}): ${r.reason}`);
+        }
       }
       return finishAutoTier3Allow(ctx, tool, input);
     }
@@ -617,8 +735,15 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     }
     if (sessionEntityOption && choice === sessionEntityOption) {
       for (const t of targets) addGrant(gateGrants, r.category, t, "entity");
+      scheduleLedgerPersist();
     } else if (sessionScopeOption && choice === sessionScopeOption) {
       for (const sc of scopes) addGrant(gateGrants, r.category, sc, "scope");
+      scheduleLedgerPersist();
+    } else if (choice === "Allow" && r.tier !== "never" && targets.length) {
+      // a plain Allow used to remember nothing, so the identical action
+      // prompted again next turn — record the entity grants too
+      for (const t of targets) addGrant(gateGrants, r.category, t, "entity");
+      scheduleLedgerPersist();
     } else if (choice === "Allow always (this project)") {
       return applyApprovalDecision(ctx, tool, input, "allow_always_local", { category: r.category });
     } else if (choice === "Allow always (global)") {
@@ -1180,6 +1305,54 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       handler: async (_args, ctx) => setMode(mode, ctx),
     });
   }
+
+  pi.registerCommand("grants", {
+    description:
+      "Show auto-mode session grants and the authorisation ledger (arg: clear)",
+    handler: async (args, ctx) => {
+      if (String(args ?? "").trim() === "clear") {
+        gateGrants.grants.length = 0;
+        gateLedger = createLedger();
+        scheduleLedgerPersist();
+        if (ctx.hasUI) ctx.ui.notify("Session grants + ledger cleared", "info");
+        else console.log("Session grants + ledger cleared");
+        return;
+      }
+      const lines: string[] = [];
+      lines.push("Session grants (user-confirmed at prompts / promoted):");
+      if (!gateGrants.grants.length) lines.push("  (none)");
+      for (const g of gateGrants.grants) {
+        lines.push(`  ${g.category}  ${g.kind === "scope" ? "scope " : ""}${g.value}`);
+      }
+      lines.push("");
+      lines.push("Ledger grants (extracted from your messages):");
+      if (!gateLedger.grants.length) lines.push("  (none)");
+      for (const g of gateLedger.grants) {
+        lines.push(`  ${g.category}  ${g.value}  — "${g.quote.slice(0, 90)}" (msg ${g.seq})`);
+      }
+      lines.push("");
+      lines.push("Ledger forbids (withdrawn/excluded):");
+      if (!gateLedger.forbids.length) lines.push("  (none)");
+      for (const f of gateLedger.forbids) {
+        lines.push(`  ${f.category === "*" ? "(all)" : f.category}  ${f.value}  — "${f.quote.slice(0, 90)}" (msg ${f.seq})`);
+      }
+      lines.push("");
+      lines.push(`Extracted messages: ${gateLedger.seen.size}. Use /grants clear to reset.`);
+      const text = lines.join("\n");
+      if (ctx.hasUI) {
+        pi.sendMessage(
+          {
+            customType: "gate-grants-list",
+            content: `**Auto-mode grants**\n\n\`\`\`\n${text}\n\`\`\``,
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      } else {
+        console.log(text);
+      }
+    },
+  });
 
   pi.registerCommand("permissions", {
     description:
@@ -2131,6 +2304,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   // ---- agent_end: idle reset + plan complete + plan offer ----------------
   pi.on("agent_end", async (event, ctx) => {
     if (ctx.hasUI) ctx.ui.setWorkingMessage();
+    flushLedgerPersist();
 
     // Plan execution in progress: announce completion when all steps are done.
     if (planExecuting && planTodos.length) {
@@ -2305,6 +2479,31 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       }
     } catch {
       /* ignore */
+    }
+
+    // Restore ledger + session grants from the newest snapshot, dropping
+    // entries whose source message is not on the current branch (rewinds).
+    // No/invalid snapshot → empty ledger; backfill rebuilds it deterministically.
+    try {
+      const snaps = readCustomEntryData(ctx.sessionManager, "gate-ledger");
+      const last = snaps[snaps.length - 1] as
+        | { v?: number; ledger?: unknown; grants?: unknown }
+        | undefined;
+      if (last?.v === 1) {
+        const refs = collectUserMessageRefs(
+          readBranchEntries(ctx.sessionManager) as never,
+        );
+        gateLedger = deserializeLedger(last.ledger, new Set(refs.map((r) => r.id)));
+        if (Array.isArray(last.grants)) {
+          for (const g of last.grants as SessionGrant[]) {
+            if (g && typeof g.category === "string" && typeof g.value === "string") {
+              addGrant(gateGrants, g.category, g.value, g.kind === "scope" ? "scope" : "entity");
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore — backfill covers it */
     }
 
     // Headless subagents ALWAYS inherit the parent's live mode from env when

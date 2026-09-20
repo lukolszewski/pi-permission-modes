@@ -23,7 +23,7 @@ export type GrantVerdict = {
 
 /** Categories where a bare verb ("push it", "clean the build dir") is a complete
  *  instruction, so an empty allowed_targets list with a verb-bearing quote may grant. */
-const BARE_VERB_CATEGORIES: Record<string, RegExp> = {
+export const BARE_VERB_CATEGORIES: Record<string, RegExp> = {
 	vcs_remote: /\b(push|publish|pr|pull request|release)\b/i,
 	vcs_discard: /\b(reset|discard|clean|throw away|revert|undo)\b/i,
 	delete_recursive: /\b(delete|remove|clean|clear|wipe|rm)\b/i,
@@ -40,7 +40,7 @@ const BARE_VERB_CATEGORIES: Record<string, RegExp> = {
 /** Categories where naming the entity is NOT the same as approving the method:
  *  the quote must also carry the action verb ("ripgrep is missing" names ripgrep
  *  but does not approve a system-wide install). */
-const METHOD_VERB_REQUIRED = new Set([
+export const METHOD_VERB_REQUIRED = new Set([
 	"package_system", "privilege", "remote_exec", "network_listen",
 ])
 

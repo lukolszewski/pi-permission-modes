@@ -52,10 +52,18 @@ Auto mode routes every tool call through a three-layer gate (spec: [docs/CLASSIF
    model involvement.
 2. **Authorisation** for *ask* — permission rules, then prompt-once **session grants**
    (`{category, entity}`; approving `docker rmi api:dev` never covers `payments:prod`), then
-   **transcript authorisation**: a small model extracts what the user allowed/forbade
-   (`response_format: json_schema`, temp 0, ≤300 tokens) and code verifies it — verbatim quote,
-   whole-token entity match (`db-backup` ≠ `db-backup-test`), forbidden-target veto, revocation.
-   The model can only narrow a decision, never widen it.
+   the **authorisation ledger** — a compact whole-session memory of what the user granted
+   or withdrew, folded from a per-message extraction call (cached per message, so each
+   message is read once ever). A grant given at message 1 still authorises at message 300;
+   an explicit revocation blocks even if an old grant is still inside the recent window;
+   pre-existing sessions are backfilled in the background, newest-first (safe while
+   incomplete). Then **transcript authorisation** over the recent window as fallback: a
+   small model extracts what the user allowed/forbade (`response_format: json_schema`,
+   temp 0, ≤300 tokens) and code verifies it — verbatim quote, whole-token entity match
+   (`db-backup` ≠ `db-backup-test`), forbidden-target veto, revocation.
+   The model can only narrow a decision, never widen it. `/grants` shows (or clears) the
+   session grants and the ledger; both are snapshotted into the session and survive
+   stop/resume.
 3. **Effect classification** for commands the tables cannot read (inline `python -c`,
    unknown binaries): same schema-constrained call, mapped back onto the tiers.
 
@@ -81,6 +89,9 @@ Works well with a self-hosted **Qwen3.5-4B** (~2 GB VRAM, ~370 ms p50/call — s
 - `baseUrl`/`modelId`: direct OpenAI-compatible endpoint (needs `response_format: json_schema`
   support — llama.cpp, vLLM, litellm). Without them the endpoint is resolved from `model`
   via pi's model registry.
+- `ledger`: `false` disables the authorisation ledger (whole-session grant memory);
+  `ledgerBackfillLimit` caps how many of the newest user messages are ever extracted
+  (default 400).
 - With the classifier disabled or unreachable the gate still runs: *allow*-tier proceeds,
   everything else prompts (UI) or is denied with the reason (headless). Fail-closed, never open.
 

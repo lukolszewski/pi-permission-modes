@@ -158,11 +158,25 @@ An ASK decision is authorised when **any** of the following holds, checked in or
 
 1. **Permission rule** — an existing CC-style `allow` rule matches (dangerous broad rules
    are still stripped on auto entry).
-2. **Session grant** — the user answered an earlier prompt with *Allow for this session*
-   (or *Allow always*) and the stored grant `{category, entity or entity-scope}` covers the
-   pending entities. Grants are exact entities or directory/namespace prefixes chosen by
-   the user in the prompt; they are never widened automatically.
-3. **Transcript grant** — the model is asked one narrow question over **user messages
+2. **Session grant** — the user answered an earlier prompt with *Allow* / *Allow for this
+   session* (or *Allow always*) and the stored grant `{category, entity or entity-scope}`
+   covers the pending entities. Grants are exact entities or directory/namespace prefixes
+   chosen by the user in the prompt; they are never widened automatically. Ledger and
+   transcript grants (below) are promoted here on first use so repeats are free.
+3. **Authorisation ledger** — pure code lookup against the per-session ledger of grants
+   and forbids folded from per-message extraction (task 4.3); this is the whole-session
+   memory, so authorisation is not a function of scroll position. All pending target
+   entities must be covered by grant entries of a **compatible kind group** (creating,
+   copying, moving, writing and chmod at a user-designated location are one group;
+   deletes additionally require a delete verb in the grant's quote; package installs,
+   sudo, remote exec and listeners require their method verb — same regexes as §3.3),
+   each grant's `seq` must be above any matching forbid's, and near-name rejection from
+   §3.3 applies unchanged. A matching **forbid** short-circuits to the prompt — the
+   recent-window fallback must not overrule an explicit revocation. Growth control:
+   entries are deduped per `(category, value, kind)` keeping the highest seq; caps
+   (200 grants / 100 forbids) evict least-recently-matched grants first; eviction's
+   failure mode is one extra prompt, never a false allow.
+4. **Transcript grant (recent-window fallback)** — the model is asked one narrow question over **user messages
    only** (assistant text and tool results are never shown): *did the user explicitly ask
    for or approve this specific action on these specific targets, and has that not been
    withdrawn later?* The answer is structured (JSON schema enforced) and contains:
@@ -180,9 +194,11 @@ An ASK decision is authorised when **any** of the following holds, checked in or
      the quote contains the category's verb — otherwise it is rejected.
    Any verification failure → not authorised (prompt). The model can therefore only
    *narrow* what the code would allow, never widen it.
-4. Otherwise: prompt (UI) with options *Allow once · Allow for session (this entity) ·
+5. Otherwise: prompt (UI) with options *Allow once · Allow for session (this entity) ·
    Allow for session (scope) · Allow always (rule) · Block*; without a UI: deny with the
    category, entities and a one-line reason so the agent can ask the user in text.
+   Every allow answer (including plain *Allow*) records a session grant for the pending
+   entities, so an identical action does not re-prompt.
 
 Prompt-once memory is keyed by `{category, entity}`; a `delete_recursive` grant for
 `./build` does not cover `./dist`, and a `write_outside` grant for `~/dev/other/` covers
@@ -190,9 +206,10 @@ files under it only if the user chose the scope option.
 
 ## 4. Model tasks (layer 1)
 
-Both tasks use `temperature 0`, `response_format: json_schema` (llama.cpp / vLLM / OpenAI
-all accept it), thinking disabled, a hard `max_tokens` of 200, and a system prompt under
-400 tokens. Any transport or schema failure → the deterministic fallback (`ASK`, prompt).
+All tasks use `temperature 0`, `response_format: json_schema` (llama.cpp / vLLM / OpenAI
+all accept it), thinking disabled, a hard `max_tokens` cap, and a system prompt under
+600 tokens. Any transport or schema failure → the deterministic fallback (`ASK`, prompt;
+a failed ledger extraction leaves the message queued for retry).
 
 ### 4.1 Effect classification (for UNKNOWN)
 
@@ -209,6 +226,24 @@ first), the pending action rendered in plain words by layer 0 ("recursively dele
 directory ./build (rm -rf ./build)"), its category and entities.
 Output: `{"authorized": "yes"|"no", "allowed_targets": string[], "forbidden_targets": string[], "quote": string}`.
 The code verification in §3.3 is mandatory; a `yes` alone never allows anything.
+
+### 4.3 Per-message grant extraction (for the ledger)
+
+Input: ONE user message (≤ 4 000 chars), nothing else — so there is no pending action to
+echo from, and requiring extracted names to appear verbatim in the message is sound.
+Output: `{"grants": [{action, targets[], quote}], "revocations": [{targets[], all, quote}]}`
+(schema-capped: ≤ 8 items each, ≤ 16 targets). Code verifies each item (verbatim quote in
+the message, targets whole-token present, pronouns dropped), maps `action` to a gate
+category via a small keyword table (unmappable actions are stored inert — they match
+nothing and only the §4.2 fallback can use them), and folds the result into the ledger.
+Run lazily on gate invocations: ≤ 2 calls inline (typically 1 — the message that started
+the turn); larger backlogs (sessions predating the plugin, restarts without a snapshot)
+drain via background backfill, **newest-first**, capped at the newest 400 user messages.
+Newest-first makes a *partially* backfilled ledger safe: every grant present already has
+all later messages processed, so nothing later-revoked can be allowed. The ledger and
+session grants are snapshotted into the session (debounced) and restored on resume,
+dropping entries whose source message is no longer on the branch; with no snapshot,
+temp-0 extraction rebuilds the same ledger from scratch.
 
 ## 5. Observability and safety rails
 
@@ -230,6 +265,7 @@ The code verification in §3.3 is mandatory; a `yes` alone never allows anything
 | false-allow on ASK cases without authorisation | ≤ 2 % |
 | over-block on ALLOW cases | ≤ 10 % |
 | transcript-authorised ASK cases correctly allowed | ≥ 80 % (residual is a prompt, not a failure) |
+| ledger-recall on long-session grants (authorisation outside the §4.2 window) | ≥ 80 % |
 | parse/transport failures | 0 % with json_schema; a failure is a prompt |
 | p50 latency for a model call on the target hardware | ≤ 500 ms |
 | verdict flip across two server restarts | 0 on layer-0 cases; reported for model cases |

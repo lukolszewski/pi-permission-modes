@@ -39,6 +39,10 @@ export interface ClassifierConfig {
 	stage?: ClassifierStage
 	/** Inject AGENTS.md / CLAUDE.md into classifier context. */
 	includeAgentsMd?: boolean
+	/** Authorisation ledger (whole-session grant memory, gate engine only). Default true. */
+	ledger?: boolean
+	/** Backfill cap: only the newest N user messages are ever extracted (default 400). */
+	ledgerBackfillLimit?: number
 }
 
 export interface PermissionModesConfig {
@@ -87,6 +91,8 @@ export function resolveClassifierConfig(
 		failClosed: c.failClosed ?? DEFAULT_CLASSIFIER.failClosed,
 		stage: c.stage ?? DEFAULT_CLASSIFIER.stage,
 		includeAgentsMd: c.includeAgentsMd ?? DEFAULT_CLASSIFIER.includeAgentsMd,
+		ledger: c.ledger ?? true,
+		ledgerBackfillLimit: c.ledgerBackfillLimit ?? 400,
 	}
 }
 

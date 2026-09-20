@@ -10,6 +10,7 @@ type Row = {
 	pass: boolean | null; tier?: string; category?: string; grantedBy?: string | null
 	reason?: string; layer0_only?: boolean; wall_ms?: number
 	model_calls?: Array<{ task: string; ms: number; ok: boolean; error?: string | null }>
+	ledger?: { grants: number; forbids: number; extract_calls: number; extract_fails: number; extract_ms: number } | null
 	error?: string
 }
 
@@ -46,6 +47,20 @@ for (const [tag, rs] of byTag) {
 	console.log(`   grant-recall: ${grantOk}/${grantNeeded} ask-tier allows granted  (${pct(grantOk, grantNeeded)})`)
 	console.log(`   layer0-only : ${layer0}/${rs.length}  (${pct(layer0, rs.length)})  errors: ${errors.length}  model-call failures: ${callFails.length}`)
 	console.log(`   model call ms p50/p95: ${p(callMs, 50)}/${p(callMs, 95)}   wall p50/p95: ${p(wallMs, 50)}/${p(wallMs, 95)}`)
+
+	// ledger metrics: long-session suite recall + extraction health across all suites
+	const ledgerRows = rs.filter((r) => r.suite === "ledger" && r.expect !== "any")
+	if (ledgerRows.length) {
+		const lAllows = ledgerRows.filter((r) => r.expect === "allow")
+		const lRecall = lAllows.filter((r) => r.effective === "allow")
+		const lBlocks = ledgerRows.filter((r) => r.expect === "block")
+		const lFalse = lBlocks.filter((r) => r.effective === "allow")
+		const byLedger = rs.filter((r) => r.grantedBy === "ledger").length
+		console.log(`   ledger-recall: ${lRecall.length}/${lAllows.length} long-session allows  (${pct(lRecall.length, lAllows.length)})  ledger-suite false-allow: ${lFalse.length}/${lBlocks.length}  granted-by-ledger (all suites): ${byLedger}`)
+	}
+	const xf = rs.map((r) => r.ledger?.extract_fails ?? 0).reduce((a, b) => a + b, 0)
+	const xc = rs.map((r) => r.ledger?.extract_calls ?? 0).reduce((a, b) => a + b, 0)
+	if (xc) console.log(`   extraction  : ${xc} calls, ${xf} failures`)
 
 	// stability across repeats
 	const byCase = new Map<string, Set<string>>()

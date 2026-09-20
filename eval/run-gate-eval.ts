@@ -14,6 +14,9 @@ import { readFileSync, existsSync, appendFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { runGate } from "../gate.ts"
+import { applyEvents, createLedger, eventsFromExtraction, type Ledger } from "../auth-ledger.ts"
+import { extractMessageGrants, type MessageExtraction } from "../model-client.ts"
+import { createGrantStore } from "../session-grants.ts"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -38,6 +41,12 @@ type V2Case = {
 	id: string; expect: "allow" | "block" | "any"; note?: string
 	msgs: string[]; tool: string; input: Record<string, unknown>
 	env?: Record<string, string>
+}
+type LedgerCase = {
+	id: string; expect: "allow" | "block" | "any"; note?: string
+	/** Strings are user messages; numbers insert that many filler messages. */
+	script: Array<string | number>
+	tool: string; input: Record<string, unknown>; env?: Record<string, string>
 }
 type Unified = { id: string; suite: string; expect: "allow" | "block" | "any"; note: string; msgs: string[]; tool: string; input: Record<string, unknown>; env?: Record<string, string> }
 
@@ -64,6 +73,20 @@ function loadV2Cases(): Unified[] {
 	})
 }
 
+function loadLedgerCases(): Unified[] {
+	const p = join(HERE, "cases-ledger.jsonl")
+	if (!existsSync(p)) return []
+	return readFileSync(p, "utf-8").split("\n").filter((l) => l.trim()).map((l) => {
+		const c = JSON.parse(l) as LedgerCase
+		const msgs: string[] = []
+		for (const part of c.script) {
+			if (typeof part === "string") msgs.push(part)
+			else for (let i = 0; i < part; i++) msgs.push(FILLER_USER[(msgs.length + i) % FILLER_USER.length]!)
+		}
+		return { id: c.id, suite: "ledger", expect: c.expect, note: c.note ?? "", msgs, tool: c.tool, input: c.input, env: c.env }
+	})
+}
+
 function arg(name: string, def?: string): string | undefined {
 	const i = process.argv.indexOf(`--${name}`)
 	return i >= 0 ? process.argv[i + 1] : def
@@ -78,7 +101,9 @@ const only = (arg("cases", "") || "").split(",").filter(Boolean)
 const out = arg("out") ?? join(HERE, `results-${tag}.jsonl`)
 const noThinkKwarg = arg("think-kwarg", "off") !== "on" // default: send enable_thinking:false
 
-const cases = [...loadOldCases(), ...loadV2Cases()].filter((c) => only.length === 0 || only.includes(c.id))
+const useLedger = arg("ledger", "on") !== "off" // all suites run with the ledger, like runtime
+
+const cases = [...loadOldCases(), ...loadV2Cases(), ...loadLedgerCases()].filter((c) => only.length === 0 || only.includes(c.id))
 const done = new Set<string>(
 	existsSync(out)
 		? readFileSync(out, "utf-8").split("\n").filter((l) => l.trim()).map((l) => { const r = JSON.parse(l); return `${r.tag}|${r.case}|${r.repeat}` })
@@ -87,8 +112,34 @@ const done = new Set<string>(
 
 const ep = { baseUrl: endpointUrl, model, timeoutMs, disableThinking: noThinkKwarg }
 
+// Per-message extraction is deterministic at temp 0, so identical messages
+// (filler, shared case preambles) are cached per repeat — same economy the
+// runtime gets from caching by message id. Cleared each repeat so restart
+// stability of extraction is still measured across repeats.
+const xcache = new Map<string, MessageExtraction | null>()
+async function buildLedger(msgs: string[]): Promise<{ ledger: Ledger; calls: number; ms: number; fails: number }> {
+	const ledger = createLedger()
+	let calls = 0, ms = 0, fails = 0
+	for (let i = 0; i < msgs.length; i++) {
+		const text = msgs[i]!
+		let x = xcache.get(text)
+		if (x === undefined) {
+			const r = await extractMessageGrants(ep, text)
+			calls++
+			ms += r.ms
+			x = r.ok ? r.value : null
+			if (!r.ok) fails++
+			xcache.set(text, x)
+		}
+		if (x) applyEvents(ledger, eventsFromExtraction(x, `m${i}`, i, text))
+		ledger.seen.add(`m${i}`)
+	}
+	return { ledger, calls, ms, fails }
+}
+
 let n = 0
 for (let rep = 1; rep <= repeats; rep++) {
+	xcache.clear()
 	for (const c of cases) {
 		const key = `${tag}|${c.id}|${rep}`
 		if (done.has(key)) continue
@@ -96,7 +147,11 @@ for (let rep = 1; rep <= repeats; rep++) {
 		const t0 = Date.now()
 		let row: Record<string, unknown>
 		try {
-			const r = await runGate(c.tool, c.input, { policy: popts, endpoint: ep, userMessages: c.msgs })
+			const lb = useLedger ? await buildLedger(c.msgs) : undefined
+			const r = await runGate(c.tool, c.input, {
+				policy: popts, endpoint: ep, userMessages: c.msgs,
+				ledger: lb?.ledger, grants: createGrantStore(),
+			})
 			const eff = r.outcome === "allow" || r.outcome === "allow-granted" ? "allow" : "block"
 			const pass = c.expect === "any" ? null : eff === c.expect
 			row = {
@@ -106,6 +161,10 @@ for (let rep = 1; rep <= repeats; rep++) {
 				entities: r.entities.map((e) => e.value), reason: r.reason.slice(0, 200),
 				model_calls: r.modelCalls.map((m) => ({ task: m.task, ms: m.ms, ok: m.ok, error: m.error ?? null })),
 				layer0_only: r.modelCalls.length === 0,
+				ledger: useLedger ? {
+					grants: lb!.ledger.grants.length, forbids: lb!.ledger.forbids.length,
+					extract_calls: lb!.calls, extract_fails: lb!.fails, extract_ms: lb!.ms,
+				} : null,
 				wall_ms: Date.now() - t0,
 			}
 			const mark = pass === null ? "·" : pass ? "✓" : "✗"
