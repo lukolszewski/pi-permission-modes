@@ -21,7 +21,7 @@ import {
 	type ModelEndpoint,
 } from "./model-client.ts"
 import { addGrant, grantsCover, type GrantStore } from "./session-grants.ts"
-import { ledgerCovers, type Ledger } from "./auth-ledger.ts"
+import { ledgerCovers, namedForbidCovers, type Ledger } from "./auth-ledger.ts"
 
 export type GateOutcome =
 	| "allow"            // run it, no user involvement
@@ -108,10 +108,29 @@ export async function runGate(tool: string, input: Record<string, unknown>, opts
 			category: finalTier === worst.tier ? worst.category : policy.category,
 			entities: dedupe(targets),
 		}
-		if (finalTier === "allow") return finish("allow", "allow", policy, "classified as project-scoped/read-only", modelCalls)
+		if (finalTier === "allow" && !(opts.ledger && namedForbidCovers(opts.ledger, policy.entities))) {
+			return finish("allow", "allow", policy, "classified as project-scoped/read-only", modelCalls)
+		}
 	}
 
-	if (policy.tier === "allow") return finish("allow", "allow", policy, policy.reason, modelCalls)
+	if (policy.tier === "allow") {
+		// "do not delete X" must bind even where the tables say allow: a named
+		// user forbid downgrades the decision to ASK so the normal pipeline
+		// (session grants → ledger seq precedence → prompt) decides. The touched
+		// path is promoted to a target so the prompt can offer session options
+		// and a plain Allow lifts it for the rest of the session.
+		const fb = opts.ledger ? namedForbidCovers(opts.ledger, policy.entities) : null
+		if (!fb) return finish("allow", "allow", policy, policy.reason, modelCalls)
+		dbg(`[gate] user forbid overrides allow: "${fb.entity}" — "${fb.entry.quote.slice(0, 60)}"`)
+		policy = {
+			...policy,
+			tier: "ask",
+			description: `${policy.description} — user said: "${fb.entry.quote.slice(0, 100)}"`,
+			entities: policy.entities.map((e) =>
+				e.kind === "path" && e.value === fb.entity ? { kind: "target" as const, value: e.value } : e,
+			),
+		}
+	}
 	if (policy.tier === "never") {
 		return finish("prompt-never", "never", policy, policy.description, modelCalls)
 	}

@@ -14,6 +14,7 @@ import {
 	seg,
 	target,
 	scope,
+	pathTouched,
 	readPackageScript,
 	hasLocalBin,
 	type Entity,
@@ -379,7 +380,7 @@ function rmHandler(argv: string[], h: HandlerContext): SegmentDecision[] {
 		}
 		if ((pc.insideProject && !pc.isGitInternal) || pc.isTemp) {
 			if (pc.insideProject && DATA_FILE_RE.test(pc.abs ?? p)) { out.push(seg("ask", "delete_data", `delete data/backup file ${disp}`, raw, [target(disp)])); continue }
-			out.push(seg("allow", "write_project", `delete file ${disp}`, raw)); continue
+			out.push(seg("allow", "write_project", `delete file ${disp}`, raw, [pathTouched(disp)])); continue
 		}
 		if (pc.isGitInternal) { out.push(seg("ask", "write_sensitive", `delete inside .git: ${disp}`, raw, [target(disp)])); continue }
 		out.push(seg("ask", "delete_outside", `delete ${disp} (outside project)`, raw, [target(disp), scope(path.posix.dirname(pc.abs ?? p) + "/")]))
@@ -392,7 +393,7 @@ function rmdirHandler(argv: string[], h: HandlerContext): SegmentDecision[] {
 	return positionals(argv).map((p) => {
 		const pc = h.classify(p)
 		if (pc.isNeverWipe || pc.isProjectRoot) return seg("never", "wipe_protected", `rmdir protected ${h.display(pc)}`, raw, [target(h.display(pc))])
-		if (pc.insideProject) return seg("allow", "write_project", `rmdir ${h.display(pc)}`, raw)
+		if (pc.insideProject) return seg("allow", "write_project", `rmdir ${h.display(pc)}`, raw, [pathTouched(h.display(pc))])
 		return seg("ask", "delete_outside", `rmdir ${h.display(pc)}`, raw, [target(h.display(pc))])
 	})
 }
@@ -510,7 +511,7 @@ function chmodHandler(argv: string[], h: HandlerContext, v: string): SegmentDeci
 		const pc = h.classify(f)
 		const disp = h.display(pc)
 		if ((pc.isNeverWipe || pc.abs === "/") && recursive) { out.push(seg("never", "perm_destroy", `${v} -R on protected ${disp}`, raw, [target(disp)])); continue }
-		if (pc.insideProject && !worldWritable && !pc.isGitInternal) { out.push(seg("allow", "write_project", `${v} ${mode} ${disp}`, raw)); continue }
+		if (pc.insideProject && !worldWritable && !pc.isGitInternal) { out.push(seg("allow", "write_project", `${v} ${mode} ${disp}`, raw, [pathTouched(disp)])); continue }
 		out.push(seg("ask", "perm_change", `${v} ${mode} ${disp}${worldWritable ? " (world-writable)" : ""}`, raw, [target(disp)]))
 	}
 	return out.length ? out : [seg("ask", "perm_change", raw.slice(0, 120), raw)]

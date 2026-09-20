@@ -79,6 +79,10 @@ const KIND_GROUPS: Record<string, string> = {
 	cluster_mutation: "cluster",
 	container_mutation: "cluster",
 	db_mutation: "db",
+	// write_project only reaches ledger matching via the named-forbid downgrade
+	// (an allow-tier action the user explicitly forbade); grouping it with
+	// fs-write lets a later "ok, you can delete X now" lift the forbid.
+	write_project: "fs-write",
 	remote_exec: "exec",
 	agent_spawn: "exec",
 	network_listen: "listen",
@@ -198,11 +202,41 @@ function enforceCaps(ledger: Ledger): void {
 function valueCovers(entry: LedgerEntry, target: string): boolean {
 	if (entry.value === "*") return true
 	if (entry.kind === "scope") {
-		const s = entry.value.toLowerCase()
-		const t = target.toLowerCase()
-		if (s.endsWith("/")) return t.startsWith(s) || t + "/" === s
+		// normalise "./x" vs "x/" before the prefix check; on miss still fall
+		// through to component matching ("results/" must cover "./results")
+		const s = entry.value.toLowerCase().replace(/^\.\//, "")
+		const t = target.toLowerCase().replace(/^\.\//, "")
+		if (s.endsWith("/") && (t.startsWith(s) || t + "/" === s)) return true
 	}
 	return entityMatchesTarget(target, entry.value)
+}
+
+/**
+ * Named-forbid scan for ALLOW-tier actions ("do not delete X" must bind even
+ * where the risk tables say allow). Considers "target" AND "path" entities
+ * (allow segments mark touched files as kind "path"). Blanket forbids
+ * (value "*", i.e. "stop doing risky things") are ignored here — they revoke
+ * grants, they do not turn default-allowed project work into prompts. A grant
+ * for the same value with a higher seq ("ok, you can delete it now") lifts
+ * the forbid, category-agnostically: lifting only restores the default allow.
+ */
+export function namedForbidCovers(
+	ledger: Ledger,
+	entities: Entity[],
+): { entity: string; entry: LedgerEntry } | null {
+	const values = entities.filter((e) => e.kind === "target" || e.kind === "path").map((e) => e.value)
+	for (const v of values) {
+		let best: LedgerEntry | null = null
+		for (const f of ledger.forbids) {
+			if (f.value === "*") continue
+			if (!valueCovers(f, v)) continue
+			if (!best || f.seq > best.seq) best = f
+		}
+		if (!best) continue
+		const lifted = ledger.grants.some((g) => g.seq > best!.seq && valueCovers(g, v))
+		if (!lifted) return { entity: v, entry: best }
+	}
+	return null
 }
 
 export type LedgerVerdict = {

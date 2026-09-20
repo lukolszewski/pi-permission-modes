@@ -184,6 +184,8 @@ If the file doesn't exist on first install, the extension creates it for you (pr
 | Shortcut | `Alt+T` | cycle thinking level (off → minimal → low → medium → high → xhigh) |
 | Shortcut | `Alt+I` | cycle model profile (next profile from `~/.pi/agent/model-profiles.json`; re-applies the model for the current mode) |
 | Command | `/permissions` | list merged allow/deny/ask rules |
+| Command | `/grants [clear]` | show (or clear) auto-mode session grants + authorisation ledger |
+| Command | `/unattended [on\|off]` | overnight mode: approval prompts soft-deny with the reason so the agent adapts or parks the step; never-tier stays hard-blocked; repeats escalate to "stop trying" (no arg = toggle; persisted with mode state) |
 | Command | `/outside-writes` | list tracked outside-cwd writes (read-only) |
 | Command | `/undo-outside-writes` | restore outside-cwd writes (selector, `all`, or `--list`) |
 | Flag | `--permission-mode <name>` | start in a mode (accepts `ask`, `plan`, `auto`, or `default` as alias; default `ask`) |

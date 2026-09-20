@@ -96,6 +96,79 @@ describe("runGate ledger step", () => {
 	})
 })
 
+describe("named forbids bind on allow-tier (gap fix)", () => {
+	const forbidTmp = {
+		type: "forbid" as const,
+		category: "*",
+		value: "/tmp/results.bin",
+		kind: "entity" as const,
+		quote: "do not delete /tmp/results.bin",
+		messageId: "m5",
+		seq: 5,
+	}
+	it("'do not delete X' turns a temp-location delete from allow into a prompt", async () => {
+		const r = await runGate("bash", { command: "rm /tmp/results.bin" }, {
+			policy: POLICY,
+			ledger: ledgerWith([forbidTmp]),
+			userMessages: [],
+		})
+		expect(r.outcome).toBe("prompt")
+		expect(r.reason).toContain("forbade")
+		expect(r.description).toContain("user said")
+	})
+	it("a later re-grant lifts the forbid (seq precedence)", async () => {
+		const r = await runGate("bash", { command: "rm /tmp/results.bin" }, {
+			policy: POLICY,
+			ledger: ledgerWith([
+				forbidTmp,
+				{ type: "grant", category: "delete_outside", value: "/tmp/results.bin", kind: "entity", quote: "ok you can delete /tmp/results.bin now", messageId: "m9", seq: 9 },
+			]),
+			userMessages: [],
+		})
+		expect(r.outcome).toBe("allow")
+	})
+	it("a session grant (one plain Allow) lifts it for the session", async () => {
+		const grants = createGrantStore()
+		grants.grants.push({ category: "write_project", value: "/tmp/results.bin", kind: "entity", at: 1 })
+		const r = await runGate("bash", { command: "rm /tmp/results.bin" }, {
+			policy: POLICY,
+			grants,
+			ledger: ledgerWith([forbidTmp]),
+			userMessages: [],
+		})
+		expect(r.outcome).toBe("allow-granted")
+	})
+	it("blanket revocations do not turn normal project work into prompts", async () => {
+		const r = await runGate("write", { path: "src/a.ts", content: "x" }, {
+			policy: POLICY,
+			ledger: ledgerWith([
+				{ type: "forbid", category: "*", value: "*", kind: "scope", quote: "stop doing anything risky", messageId: "m5", seq: 5 },
+			]),
+			userMessages: [],
+		})
+		expect(r.outcome).toBe("allow")
+	})
+	it("unrelated allow-tier work is untouched by a named forbid", async () => {
+		const r = await runGate("bash", { command: "rm /tmp/other.bin" }, {
+			policy: POLICY,
+			ledger: ledgerWith([forbidTmp]),
+			userMessages: [],
+		})
+		expect(r.outcome).toBe("allow")
+	})
+	it("scope forbid 'results/' covers ./results (normalisation fix)", async () => {
+		const r = await runGate("bash", { command: "rm -rf ./results" }, {
+			policy: POLICY,
+			ledger: ledgerWith([
+				{ type: "forbid", category: "*", value: "results/", kind: "scope", quote: "do not delete the results/ folder", messageId: "m5", seq: 5 },
+			]),
+			userMessages: [],
+		})
+		expect(r.outcome).toBe("prompt")
+		expect(r.reason).toContain("forbade")
+	})
+})
+
 describe("collectUserMessageRefs", () => {
 	const branch = [
 		{ type: "message", id: "a1", message: { role: "user", content: "hello" } },

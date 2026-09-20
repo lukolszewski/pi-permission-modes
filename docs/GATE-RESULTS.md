@@ -187,5 +187,12 @@ heuristics, per the standing guidance):
 - Named revocations forbid the target across ALL categories ("don't touch
   ~/backups" also blocks writes there); generic-kind revocations forbid their
   kind group. Both directions over-block rather than under-block by design.
+- Named forbids also bind on ALLOW-tier actions (2026-09-20 fix): "do not
+  delete /tmp/results.bin" downgrades the temp/project auto-allow to a prompt.
+  Allow-tier fs segments mark touched paths as `path` entities; a pure-code
+  scan checks them against named forbids before the gate returns allow
+  (blanket "stop everything" revocations do NOT block normal project work —
+  they only revoke grants). A later re-grant or one prompt approval lifts it.
+  Scope values like "results/" now also match "./results" (normalisation).
 - Extraction cost in runtime: one ~330 ms call per user message, once ever
   (cached by message id, snapshotted); backfill capped at the newest 400.

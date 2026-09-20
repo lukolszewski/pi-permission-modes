@@ -222,6 +222,13 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   let classifierDenialState: DenialTrackingState = createDenialTrackingState();
   const gateGrants = createGrantStore();
   let gateLedger = createLedger();
+  /** Unattended mode: approval prompts soft-deny with an explanation instead
+   *  of blocking on a dialog nobody will answer (overnight runs). Never-tier
+   *  stays a hard deny. Toggled with /unattended, persisted with mode state. */
+  let unattendedMode = false;
+  /** Anti-loop: identical denied actions escalate instead of re-prompting the
+   *  model with the same text all night. */
+  const unattendedDenialCounts = new Map<string, number>();
   /** Throttle: background backfill pauses while a live gate call is in flight. */
   let gateCallInFlight = false;
   let ledgerBackfillActive = false;
@@ -288,7 +295,19 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       planExecuting,
       planTodos,
       lastExtractedPlanHash,
+      unattended: unattendedMode,
     });
+  }
+
+  /** Soft-denial text for unattended mode. Repeats of the same denied action
+   *  escalate to "stop trying" so a stubborn model cannot burn the night. */
+  function unattendedDenialText(key: string): string {
+    const n = (unattendedDenialCounts.get(key) ?? 0) + 1;
+    if (unattendedDenialCounts.size < 200) unattendedDenialCounts.set(key, n);
+    if (n >= 3) {
+      return ` Unattended mode: you have already been denied this exact action ${n - 1} times this run. STOP attempting it — park this step now and continue with other work; list all parked steps when the user returns.`;
+    }
+    return ` Unattended mode: the user is away and cannot approve anything right now. Do not retry the same command. Either accomplish this a different way within the already-approved bounds, or park this step and list all parked steps when the user returns.`;
   }
 
   type ApprovalDecision =
@@ -446,6 +465,14 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         });
       }
       return applyApprovalDecision(ctx, tool, input, "allow");
+    }
+    if (unattendedMode) {
+      pendingComplianceInject = true;
+      complianceCategory = category;
+      return {
+        block: true,
+        reason: `${tool} not auto-approved: ${label}.` + unattendedDenialText(`${tool}|${label}`),
+      };
     }
     const choice = await ctx.ui.select(`Allow ${tool}? ${label}`, [
       "Allow",
@@ -705,6 +732,13 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     r: GateResult,
   ): Promise<Block | undefined> {
     const label = gatePromptLabel(r);
+    if (unattendedMode) {
+      classifierDenialState = recordClassifierDenial(classifierDenialState);
+      pendingComplianceInject = true;
+      complianceCategory = r.category;
+      const key = `${tool}|${r.category}|${r.entities.filter((e) => e.kind === "target").map((e) => e.value).join(",")}`;
+      return { block: true, reason: gateDenialMessage(r) + unattendedDenialText(key) };
+    }
     if (!ctx.hasUI) {
       if (r.tier === "never") {
         pendingComplianceInject = true;
@@ -1307,6 +1341,24 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       handler: async (_args, ctx) => setMode(mode, ctx),
     });
   }
+
+  pi.registerCommand("unattended", {
+    description:
+      "Unattended mode: approval prompts soft-deny with the reason so the agent adapts (on|off, no arg = toggle)",
+    handler: async (args, ctx) => {
+      const a = String(args ?? "").trim().toLowerCase();
+      if (a === "on") unattendedMode = true;
+      else if (a === "off") unattendedMode = false;
+      else unattendedMode = !unattendedMode;
+      if (!unattendedMode) unattendedDenialCounts.clear();
+      persistState();
+      const msg = unattendedMode
+        ? "Unattended mode ON — approval prompts will soft-deny with the reason; the agent is told to work within approved bounds or park the step. Never-tier actions stay hard-blocked."
+        : "Unattended mode OFF — approval prompts are interactive again.";
+      if (ctx.hasUI) ctx.ui.notify(msg, "info");
+      else console.log(msg);
+    },
+  });
 
   pi.registerCommand("grants", {
     description:
@@ -2461,6 +2513,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
             planTodos?: TodoItem[];
             lastExtractedPlanHash?: string;
             activeProfile?: string;
+            unattended?: boolean;
           }
         | undefined;
       if (last) {
@@ -2479,6 +2532,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
           lastExtractedPlanHash = last.lastExtractedPlanHash;
         if (typeof last.activeProfile === "string")
           activeProfile = last.activeProfile;
+        if (typeof last.unattended === "boolean")
+          unattendedMode = last.unattended;
       }
     } catch {
       /* ignore */
@@ -2580,6 +2635,23 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     let decision: ForwardedDecision = "block";
     let approved = false;
     let denialReason: string | undefined = `${request.tool} blocked by user`;
+
+    // Unattended parent: deny subagent requests with the same guidance the
+    // parent's own model gets — nobody is watching either session.
+    if (unattendedMode) {
+      await writeForwardedResponse(agentDir, request.targetSessionId, {
+        id: request.id,
+        challenge: request.challenge,
+        approved: false,
+        decision: "block",
+        responderSessionId,
+        respondedAt: new Date().toISOString(),
+        denialReason:
+          `${request.tool} not auto-approved: ${request.message}.` +
+          unattendedDenialText(`fwd|${request.tool}|${request.message}`),
+      });
+      return;
+    }
 
     try {
       const choice = await ctx.ui.select(title, [

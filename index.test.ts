@@ -1448,6 +1448,96 @@ describe("bypass mode: outside-cwd write tracking", () => {
 })
 
 
+// ---- /unattended: prompts soft-deny with guidance instead of blocking ----
+describe("unattended mode", () => {
+	let pi: FakePi
+	let configTmp: string
+	let realProjectRoot: string
+
+	beforeEach(async () => {
+		pi = createFakePi()
+		configTmp = mkdtempSync(join(tmpdir(), "pm-idx-unatt-"))
+		setConfigPath(join(configTmp, "permission-modes.json"))
+		writeFileSync(
+			join(configTmp, "permission-modes.json"),
+			JSON.stringify({ classifier: { enabled: false } }),
+		)
+		realProjectRoot = process.cwd()
+		permissionModesExtension(makeFakePiForExtension(pi))
+		pi.flags["permission-mode"] = "auto"
+		await pi.simulateSessionStart(realProjectRoot)
+	})
+
+	afterEach(() => {
+		rmSync(configTmp, { recursive: true, force: true })
+	})
+
+	function ctxWithSelect(calls: string[]) {
+		return makeCtx(pi, {
+			cwd: realProjectRoot,
+			ui: {
+				select: async (title: string) => {
+					calls.push(title)
+					return "Block"
+				},
+			},
+		})
+	}
+
+	it("ask-tier prompt becomes a soft denial with reason and guidance; no dialog shown", async () => {
+		await pi.simulateCommand("unattended", "on", makeCtx(pi, { cwd: realProjectRoot }))
+		const selects: string[] = []
+		const result = (await pi.simulateToolCall(
+			"write",
+			{ path: "/opt/outside.txt" },
+			ctxWithSelect(selects),
+		)) as { block?: boolean; reason?: string }
+		expect(result?.block).toBe(true)
+		expect(result?.reason).toContain("Unattended mode")
+		expect(result?.reason).toContain("park this step")
+		expect(selects).toHaveLength(0)
+	})
+
+	it("repeat-denied identical action escalates to STOP", async () => {
+		await pi.simulateCommand("unattended", "on", makeCtx(pi, { cwd: realProjectRoot }))
+		let last: { reason?: string } | undefined
+		for (let i = 0; i < 3; i++) {
+			last = (await pi.simulateToolCall(
+				"write",
+				{ path: "/opt/outside.txt" },
+				ctxWithSelect([]),
+			)) as { reason?: string }
+		}
+		expect(last?.reason).toContain("STOP attempting it")
+	})
+
+	it("never-tier stays hard-blocked with the high-risk wording", async () => {
+		await pi.simulateCommand("unattended", "on", makeCtx(pi, { cwd: realProjectRoot }))
+		const selects: string[] = []
+		const result = (await pi.simulateToolCall(
+			"bash",
+			{ command: "sudo dd if=/dev/zero of=/dev/sda" },
+			ctxWithSelect(selects),
+		)) as { block?: boolean; reason?: string }
+		expect(result?.block).toBe(true)
+		expect(result?.reason).toContain("never auto-approved")
+		expect(selects).toHaveLength(0)
+	})
+
+	it("off restores interactive prompting", async () => {
+		await pi.simulateCommand("unattended", "on", makeCtx(pi, { cwd: realProjectRoot }))
+		await pi.simulateCommand("unattended", "off", makeCtx(pi, { cwd: realProjectRoot }))
+		const selects: string[] = []
+		const result = (await pi.simulateToolCall(
+			"write",
+			{ path: "/opt/outside.txt" },
+			ctxWithSelect(selects),
+		)) as { block?: boolean }
+		expect(selects.length).toBeGreaterThan(0) // dialog shown again
+		expect(result?.block).toBe(true) // we answered Block
+	})
+})
+
 describe("/outside-writes and /undo-outside-writes commands", () => {
 	let pi: FakePi
 	let cwd: string

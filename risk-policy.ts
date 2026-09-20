@@ -18,7 +18,11 @@ import { classifyVerb, type HandlerContext } from "./risk-handlers.ts"
 
 export type Tier = "allow" | "ask" | "never" | "unknown"
 
-export type Entity = { kind: "target" | "scope"; value: string }
+/** "target"/"scope" drive prompts, grant options and grant matching. "path"
+ *  marks files an ALLOW-tier segment touches — consulted ONLY by the ledger's
+ *  named-forbid scan ("do not delete X" must bind even where the tables say
+ *  allow); every other consumer filters on target/scope and ignores it. */
+export type Entity = { kind: "target" | "scope" | "path"; value: string }
 
 export type SegmentDecision = {
 	tier: Tier
@@ -95,6 +99,7 @@ export function seg(tier: Tier, category: string, description: string, command: 
 
 export const target = (v: string): Entity => ({ kind: "target", value: v })
 export const scope = (v: string): Entity => ({ kind: "scope", value: v })
+export const pathTouched = (v: string): Entity => ({ kind: "path", value: v })
 
 // ------------------------------------------------------------------ tool-level
 
@@ -161,8 +166,8 @@ export function decideWrite(pc: PathClass, ctx: PathContext, verb: string, conte
 	if (pc.isSecret) return seg("ask", "write_sensitive", `${verb} secret-bearing file ${disp}`, cmd, [target(disp)])
 	if (pc.isGitInternal) return seg("ask", "write_sensitive", `${verb} inside .git (${disp})`, cmd, [target(disp)])
 	if (pc.isSensitiveConfig) return seg("ask", "write_sensitive", `${verb} sensitive config ${disp}`, cmd, [target(disp)])
-	if (pc.insideProject) return seg("allow", "write_project", `${verb} ${disp}`, cmd)
-	if (pc.isTemp) return seg("allow", "write_project", `${verb} ${disp} (temp location)`, cmd)
+	if (pc.insideProject) return seg("allow", "write_project", `${verb} ${disp}`, cmd, [pathTouched(disp)])
+	if (pc.isTemp) return seg("allow", "write_project", `${verb} ${disp} (temp location)`, cmd, [pathTouched(disp)])
 	return seg("ask", "write_outside", `${verb} outside the project: ${disp}`, cmd, [target(disp), scope(path.posix.dirname(pc.abs!) + "/")])
 }
 
