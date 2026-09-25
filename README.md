@@ -67,6 +67,12 @@ Auto mode routes every tool call through a three-layer gate (spec: [docs/CLASSIF
 3. **Effect classification** for commands the tables cannot read (inline `python -c`,
    unknown binaries): same schema-constrained call, mapped back onto the tiers.
 
+If a bash command is **malformed** (unterminated quote / heredoc / `$( )`), the lexer
+reports it instead of emitting garbage segments: the gate refuses to run it and returns
+a *fix-and-simplify-and-retry* message to the agent (no user prompt, no model call) so it
+rewrites the command; a small budget escalates to a prompt (attended) or a parked step
+(unattended) if it keeps failing.
+
 A parse failure is structurally impossible (`json_schema`), any transport failure falls
 closed to a prompt, and verdicts are reproducible across server restarts (measured 0 flips).
 Works well with a self-hosted **Qwen3.5-4B** (~2 GB VRAM, ~370 ms p50/call — see

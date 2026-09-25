@@ -38,6 +38,9 @@ export type GateResult = {
 	reason: string
 	/** Grant source when outcome is allow-granted. */
 	grantedBy?: "session-grant" | "ledger" | "transcript"
+	/** The command could not be parsed; the caller should ask the model to
+	 *  fix/simplify and retry rather than prompt the user. */
+	unparseable?: boolean
 	policy: PolicyDecision
 	modelCalls: Array<{ task: "grant" | "effect"; ms: number; ok: boolean; error?: string; raw?: string }>
 }
@@ -74,6 +77,17 @@ export async function runGate(tool: string, input: Record<string, unknown>, opts
 	const dbg = opts.debug ?? (() => {})
 	let policy = evaluateToolCall(tool, input, opts.policy)
 	dbg(`[gate] layer0: ${policy.tier} ${policy.category} — ${policy.description}`)
+
+	// ---- unparseable: refuse and ask the model to fix/simplify (no model call).
+	// The command is malformed (unterminated quote/heredoc/substitution), so the
+	// segment list is unreliable; do not send fabricated fragments to the effect
+	// model and do not prompt the user about a broken command.
+	if (policy.unparseable) {
+		dbg(`[gate] unparseable: ${policy.reason}`)
+		const r = finish("prompt", "ask", policy, policy.reason, modelCalls)
+		r.unparseable = true
+		return r
+	}
 
 	// ---- resolve UNKNOWN segments via effect classification
 	if (policy.tier === "unknown") {

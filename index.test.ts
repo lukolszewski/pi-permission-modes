@@ -1538,6 +1538,65 @@ describe("unattended mode", () => {
 	})
 })
 
+// ---- unparseable command → ask-the-model-to-fix-and-retry, no user prompt ----
+describe("unparseable-command fix-and-retry", () => {
+	let pi: FakePi
+	let configTmp: string
+	let realProjectRoot: string
+
+	beforeEach(async () => {
+		pi = createFakePi()
+		configTmp = mkdtempSync(join(tmpdir(), "pm-idx-unp-"))
+		setConfigPath(join(configTmp, "permission-modes.json"))
+		writeFileSync(
+			join(configTmp, "permission-modes.json"),
+			JSON.stringify({ classifier: { enabled: false } }),
+		)
+		realProjectRoot = process.cwd()
+		permissionModesExtension(makeFakePiForExtension(pi))
+		pi.flags["permission-mode"] = "auto"
+		await pi.simulateSessionStart(realProjectRoot)
+	})
+	afterEach(() => rmSync(configTmp, { recursive: true, force: true }))
+
+	const MALFORMED = `ssh h "find / | awk 'x` // unterminated double quote
+
+	it("blocks a malformed command with a fix-and-retry message, no dialog", async () => {
+		const selects: string[] = []
+		const result = (await pi.simulateToolCall(
+			"bash",
+			{ command: MALFORMED },
+			makeCtx(pi, { cwd: realProjectRoot, ui: { select: async (t: string) => { selects.push(t); return "Block" } } }),
+		)) as { block?: boolean; reason?: string }
+		expect(result?.block).toBe(true)
+		expect(result?.reason).toMatch(/couldn't safely analyze|does not parse|doesn't parse/i)
+		expect(result?.reason).toMatch(/simpler|rewrite|simplify/i)
+		expect(selects).toHaveLength(0) // never prompts the user
+	})
+
+	it("a parseable command in between resets the retry budget", async () => {
+		const ctx = () => makeCtx(pi, { cwd: realProjectRoot, ui: { select: async () => "Block" } })
+		// exhaust budget: 4 malformed in a row (budget 3) → 4th still a block message
+		for (let i = 0; i < 4; i++) await pi.simulateToolCall("bash", { command: MALFORMED }, ctx())
+		// a clean allow-tier command resets the counter
+		await pi.simulateToolCall("bash", { command: "ls -la" }, ctx())
+		// next malformed is treated as the 1st again → fix message, not escalation
+		const again = (await pi.simulateToolCall("bash", { command: MALFORMED }, ctx())) as { reason?: string }
+		expect(again?.reason).toMatch(/simpler|rewrite|simplify/i)
+		expect(again?.reason).not.toMatch(/in a row/i)
+	})
+
+	it("well-formed destructive command is unaffected (still prompts normally)", async () => {
+		const selects: string[] = []
+		await pi.simulateToolCall(
+			"bash",
+			{ command: "rm -rf ./build" },
+			makeCtx(pi, { cwd: realProjectRoot, ui: { select: async (t: string) => { selects.push(t); return "Block" } } }),
+		)
+		expect(selects.length).toBeGreaterThan(0) // real prompt shown, not the fix-retry path
+	})
+})
+
 describe("/outside-writes and /undo-outside-writes commands", () => {
 	let pi: FakePi
 	let cwd: string

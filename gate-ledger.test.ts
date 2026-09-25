@@ -96,6 +96,24 @@ describe("runGate ledger step", () => {
 	})
 })
 
+describe("unparseable commands short-circuit before any model call", () => {
+	it("malformed command → prompt with unparseable flag, no effect model call", async () => {
+		const { fn } = mockExtractionFetch([])
+		const r = await runGate("bash", { command: `ssh h "find / | awk 'x` }, {
+			policy: POLICY,
+			endpoint: EP, // present, but must NOT be called
+		})
+		expect(r.unparseable).toBe(true)
+		expect(r.outcome).toBe("prompt")
+		expect(r.modelCalls).toHaveLength(0)
+		expect(fn).not.toHaveBeenCalled()
+	})
+	it("well-formed unknown command still reaches the effect model (not misflagged)", async () => {
+		const r = await runGate("bash", { command: "ls -la | grep foo" }, { policy: POLICY })
+		expect(r.unparseable).toBeFalsy()
+	})
+})
+
 describe("named forbids bind on allow-tier (gap fix)", () => {
 	const forbidTmp = {
 		type: "forbid" as const,

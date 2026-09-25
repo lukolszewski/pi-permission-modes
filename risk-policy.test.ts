@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { evaluateBash, evaluateToolCall } from "./risk-policy.ts"
-import { lexShell } from "./shell-lexer.ts"
+import { lexShell, lexShellChecked } from "./shell-lexer.ts"
 import { classifyPath } from "./risk-paths.ts"
 import { entityMatchesTarget, verifyGrant } from "./grant-verify.ts"
 import { addGrant, createGrantStore, grantsCover } from "./session-grants.ts"
@@ -36,6 +36,49 @@ describe("shell-lexer", () => {
 	it("sees commands inside control structures", () => {
 		const [c] = lexShell("if [ -d build ]; then rm -rf build; fi").filter((c) => c.argv[0]?.value === "rm")
 		expect(c).toBeDefined()
+	})
+})
+
+describe("shell-lexer termination detection (lexShellChecked)", () => {
+	const ok = (cmd: string) => lexShellChecked(cmd).ok
+	it("accepts well-formed commands, including the awkward-but-valid ones", () => {
+		for (const c of [
+			"cat a \\\n| sort | uniq -c",
+			"awk 'BEGIN{print \"a|b\"} {x++}' f",
+			"find . -printf '%s\\t%p | %T@\\n'",
+			`ssh h "find / | awk '{s+=$1} END{print s}'"`,
+			"echo hi # it's fine",
+			"printf $'a\\tb\\n'",
+			"cat <<EOF\nbody 'with quote\nEOF",
+			"cat <<'EOF'\n$stays literal\nEOF\necho done",
+			"echo $(date +%Y) done",
+			'git commit -m "a; b && c"',
+		]) expect(ok(c), c).toBe(true)
+	})
+	it("flags genuinely malformed input", () => {
+		expect(lexShellChecked("echo 'oops").reason).toMatch(/single quote/)
+		expect(lexShellChecked('ssh h "find / | awk \'x').reason).toMatch(/double quote/)
+		expect(lexShellChecked("cat <<EOF\nno terminator here").reason).toMatch(/heredoc/)
+		expect(lexShellChecked("echo $(date").reason).toMatch(/substitution/)
+	})
+	it("the real pi-session command (unbalanced ssh/awk quote) is unparseable", () => {
+		// abbreviated form of session 01a0d9b5: ssh arg's closing quote missing
+		const cmd = `ssh kamserw "find /a | awk '\nBEGIN{C=1}\n{s+=\\$1}\nEND{printf \\"D\\t%.0f\\n\\", s}\n' >/dev/null 2>&1\necho "=== a | b | c ==="`;
+		expect(lexShellChecked(cmd).ok).toBe(false)
+	})
+})
+
+describe("evaluateBash unparseable gate", () => {
+	it("malformed command → ask/unparseable_command with the flag, no phantom segments", () => {
+		const d = evaluateBash(`ssh h "find / | awk 'x`, OPTS)
+		expect(d.unparseable).toBe(true)
+		expect(d.tier).toBe("ask")
+		expect(d.category).toBe("unparseable_command")
+		expect(d.unknown).toHaveLength(0)
+	})
+	it("well-formed command is not flagged unparseable", () => {
+		expect(evaluateBash("ls -la | grep foo", OPTS).unparseable).toBeFalsy()
+		expect(evaluateBash("rm -rf ./build", OPTS).unparseable).toBeFalsy()
 	})
 })
 

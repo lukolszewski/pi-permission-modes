@@ -229,6 +229,11 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   /** Anti-loop: identical denied actions escalate instead of re-prompting the
    *  model with the same text all night. */
   const unattendedDenialCounts = new Map<string, number>();
+  /** Consecutive unparseable commands — resets on any command that parses.
+   *  Bounds the fix-and-retry loop so a model that keeps emitting broken shell
+   *  doesn't spin forever. */
+  let consecutiveUnparseable = 0;
+  const UNPARSEABLE_RETRY_BUDGET = 3;
   /** Throttle: background backfill pauses while a live gate call is in flight. */
   let gateCallInFlight = false;
   let ledgerBackfillActive = false;
@@ -711,6 +716,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     } finally {
       gateCallInFlight = false;
     }
+    // Reset the fix-retry counter as soon as a command parses cleanly.
+    if (!r.unparseable) consecutiveUnparseable = 0;
     if (r.outcome === "allow" || r.outcome === "allow-granted") {
       classifierDenialState = recordClassifierSuccess(classifierDenialState);
       if (r.grantedBy) {
@@ -722,7 +729,58 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       }
       return finishAutoTier3Allow(ctx, tool, input);
     }
+    if (r.unparseable) {
+      return await handleUnparseable(ctx, tool, input, r, debugOn);
+    }
     return promptGateApproval(ctx, tool, input, r);
+  }
+
+  /** A malformed command (unterminated quote/heredoc/substitution) is never a
+   *  user permission question — we can't classify it, so we refuse to run it and
+   *  ask the model to rewrite/simplify. The model receives this as the tool
+   *  result and retries on its own; the user is not prompted. A budget bounds
+   *  the loop: past it, unattended parks the step and attended asks the human. */
+  async function handleUnparseable(
+    ctx: ExtensionContext,
+    tool: string,
+    input: Record<string, unknown>,
+    r: GateResult,
+    debugOn: boolean,
+  ): Promise<Block> {
+    consecutiveUnparseable++;
+    const why = r.reason || "it does not parse cleanly";
+    const fix =
+      `${tool} was not run: I couldn't safely analyze this command — ${why}. ` +
+      `Rewrite it as simpler command(s): avoid deeply nested quoting, split multi-step ` +
+      `pipelines, and put complex awk/sed/python programs in a temp script file or a ` +
+      `heredoc instead of inline. Then try again.`;
+    if (debugOn) {
+      console.debug(
+        `[permission-modes] unparseable (#${consecutiveUnparseable}): ${why}`,
+      );
+    }
+    if (consecutiveUnparseable <= UNPARSEABLE_RETRY_BUDGET) {
+      return { block: true, reason: fix };
+    }
+    // budget exhausted
+    if (unattendedMode) {
+      pendingComplianceInject = true;
+      complianceCategory = "unparseable_command";
+      return {
+        block: true,
+        reason:
+          `${fix} You have produced ${consecutiveUnparseable} unparseable commands in a row — ` +
+          `stop retrying this step, park it, and continue with other work; list parked steps when the user returns.`,
+      };
+    }
+    // attended: hand it to the human, who can see the agent is stuck
+    return promptWithPermissionOptions(
+      ctx,
+      tool,
+      input,
+      `⚠️ the agent produced ${consecutiveUnparseable} commands in a row that don't parse (${why}). Last command shown below.`,
+      "unparseable_command",
+    );
   }
 
   async function promptGateApproval(

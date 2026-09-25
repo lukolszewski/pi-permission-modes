@@ -143,6 +143,15 @@ targets named `deploy|publish|release|clean-all`, scripts outside the project, `
 `run`/`exec`. The model receives the raw command (and the inline code if any) and answers a
 closed-vocabulary **effect classification**; the effect maps back onto 2.1–2.3.
 
+UNKNOWN is distinct from **UNPARSEABLE**. A command that the lexer cannot tokenise
+cleanly — it reaches end-of-input still inside a quote, heredoc, or `$( )`
+substitution — is malformed; its segment list would be fabricated from the unparsed
+remainder (the failure that produced phantom "commands" from an awk `printf` body in
+one real session). Such a command is **not** sent to the effect model and **not**
+turned into a user prompt. It is refused, and the agent is asked to rewrite/simplify
+and retry (§5). This is fail-closed (an unparseable command can no longer degrade into
+an allow via phantom segments) and is a security improvement, not just UX.
+
 ### 2.5 Secret-bearing paths
 
 `~/.ssh/**` (except `known_hosts`, `config`), `~/.aws/**`, `~/.gnupg/**`, `~/.kube/config`,

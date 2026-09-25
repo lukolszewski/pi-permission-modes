@@ -12,7 +12,7 @@
 
 import path from "node:path"
 import { existsSync, readFileSync } from "node:fs"
-import { lexShell, type SimpleCommand, type Word } from "./shell-lexer.ts"
+import { lexShell, lexShellChecked, type SimpleCommand, type Word } from "./shell-lexer.ts"
 import { classifyPath, displayPath, expandTilde, type PathClass, type PathContext } from "./risk-paths.ts"
 import { classifyVerb, type HandlerContext } from "./risk-handlers.ts"
 
@@ -46,6 +46,10 @@ export type PolicyDecision = {
 	segments: SegmentDecision[]
 	/** Segments that need the model (tier === "unknown"). */
 	unknown: SegmentDecision[]
+	/** The command could not be tokenised cleanly (unterminated quote/heredoc/
+	 *  substitution). The segment list is unreliable — the gate should refuse and
+	 *  ask the model to fix/simplify, not trust the fabricated segments. */
+	unparseable?: boolean
 }
 
 export type PolicyOptions = {
@@ -184,12 +188,25 @@ export function evaluateBash(command: string, opts: PolicyOptions): PolicyDecisi
 		return mergeDecisions([seg("never", "process_massacre", "fork bomb (self-replicating function)", text)], text)
 	}
 	const depth = opts.depth ?? 0
-	if (depth > MAX_DEPTH) return mergeDecisions([seg("unknown", "unknown_command", `run \`${text.slice(0, 200)}\``, text)], text)
+	if (depth > MAX_DEPTH) {
+		// too deeply nested to analyse reliably — treat like an unparseable command
+		const d = mergeDecisions([seg("ask", "unparseable_command", "command is too deeply nested to analyse", text)], text)
+		return { ...d, unparseable: true, reason: "nesting too deep to classify safely" }
+	}
+	// Fail closed on genuinely malformed input (unterminated quote/heredoc/
+	// substitution): the lexer would otherwise emit confident phantom segments
+	// from the unparsed remainder. Refuse and let the caller ask the model to fix.
 	let cmds: SimpleCommand[]
 	try {
-		cmds = lexShell(text)
+		const lexed = lexShellChecked(text)
+		if (!lexed.ok) {
+			const d = mergeDecisions([seg("ask", "unparseable_command", `command does not parse: ${lexed.reason}`, text)], text)
+			return { ...d, unparseable: true, reason: lexed.reason ?? "command does not parse cleanly" }
+		}
+		cmds = lexed.commands
 	} catch {
-		return mergeDecisions([seg("unknown", "unknown_command", `run \`${text.slice(0, 200)}\``, text)], text)
+		const d = mergeDecisions([seg("ask", "unparseable_command", "command could not be parsed", text)], text)
+		return { ...d, unparseable: true, reason: "command could not be parsed" }
 	}
 	const base = makeCtx(opts)
 	const state: WalkState = { cwd: base.cwd, vars: {}, prevArgv: null }

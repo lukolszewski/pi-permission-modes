@@ -68,7 +68,16 @@ type Token =
 	| { kind: "newline" }
 
 /** Extract the balanced body starting after `$(` / `<(` / `>(` at index i (which points at "("). */
-function readBalanced(src: string, i: number, open: string, close: string): { body: string; end: number } {
+/** Accumulates the first "ran off the end of the input mid-construct" problem.
+ *  Used only by lexShellChecked; classification callers pass nothing and are
+ *  unaffected. */
+export type LexDiagnostics = { ok: boolean; reason?: string }
+
+function fail(diag: LexDiagnostics | undefined, reason: string): void {
+	if (diag && diag.ok) { diag.ok = false; diag.reason = reason }
+}
+
+function readBalanced(src: string, i: number, open: string, close: string, diag?: LexDiagnostics): { body: string; end: number } {
 	let depth = 0
 	let quote: "'" | '"' | null = null
 	let j = i
@@ -87,6 +96,7 @@ function readBalanced(src: string, i: number, open: string, close: string): { bo
 			if (depth === 0) return { body: src.slice(i + 1, j), end: j }
 		}
 	}
+	fail(diag, `unbalanced ${open}${close} substitution`)
 	return { body: src.slice(i + 1), end: src.length - 1 }
 }
 
@@ -94,7 +104,7 @@ function readBalanced(src: string, i: number, open: string, close: string): { bo
  * Tokenise one word starting at `i`. Returns the word and the index just after it.
  * Collects substitutions found inside into `subs`.
  */
-function readWord(src: string, i: number, subs: string[]): { word: Word; end: number } {
+function readWord(src: string, i: number, subs: string[], diag?: LexDiagnostics): { word: Word; end: number } {
 	let value = ""
 	let raw = ""
 	let quoted = false
@@ -105,6 +115,7 @@ function readWord(src: string, i: number, subs: string[]): { word: Word; end: nu
 		const ch = src[j]!
 		if (ch === "'") {
 			const endQ = src.indexOf("'", j + 1)
+			if (endQ === -1) fail(diag, "unterminated single quote")
 			const inner = endQ === -1 ? src.slice(j + 1) : src.slice(j + 1, endQ)
 			value += inner
 			raw += src.slice(j, endQ === -1 ? src.length : endQ + 1)
@@ -125,7 +136,7 @@ function readWord(src: string, i: number, subs: string[]): { word: Word; end: nu
 					continue
 				}
 				if (c === "$" && src[k + 1] === "(") {
-					const { body, end } = readBalanced(src, k + 1, "(", ")")
+					const { body, end } = readBalanced(src, k + 1, "(", ")", diag)
 					subs.push(body)
 					hasExpansion = true
 					value += src.slice(k, end + 1)
@@ -135,6 +146,7 @@ function readWord(src: string, i: number, subs: string[]): { word: Word; end: nu
 				}
 				if (c === "`") {
 					const endB = src.indexOf("`", k + 1)
+					if (endB === -1) fail(diag, "unterminated backtick substitution")
 					const body = endB === -1 ? src.slice(k + 1) : src.slice(k + 1, endB)
 					subs.push(body)
 					hasExpansion = true
@@ -148,6 +160,7 @@ function readWord(src: string, i: number, subs: string[]): { word: Word; end: nu
 				raw += c
 				k++
 			}
+			if (k >= src.length && src[k] !== '"') fail(diag, "unterminated double quote")
 			raw += '"'
 			j = k + 1
 			continue
@@ -164,7 +177,7 @@ function readWord(src: string, i: number, subs: string[]): { word: Word; end: nu
 			continue
 		}
 		if (ch === "$" && src[j + 1] === "(") {
-			const { body, end } = readBalanced(src, j + 1, "(", ")")
+			const { body, end } = readBalanced(src, j + 1, "(", ")", diag)
 			subs.push(body)
 			hasExpansion = true
 			value += src.slice(j, end + 1)
@@ -175,6 +188,7 @@ function readWord(src: string, i: number, subs: string[]): { word: Word; end: nu
 		}
 		if (ch === "`") {
 			const endB = src.indexOf("`", j + 1)
+			if (endB === -1) fail(diag, "unterminated backtick substitution")
 			const body = endB === -1 ? src.slice(j + 1) : src.slice(j + 1, endB)
 			subs.push(body)
 			hasExpansion = true
@@ -186,7 +200,7 @@ function readWord(src: string, i: number, subs: string[]): { word: Word; end: nu
 			continue
 		}
 		if ((ch === "<" || ch === ">") && src[j + 1] === "(" ) {
-			const { body, end } = readBalanced(src, j + 1, "(", ")")
+			const { body, end } = readBalanced(src, j + 1, "(", ")", diag)
 			subs.push(body)
 			hasExpansion = true
 			const piece = src.slice(j, end + 1)
@@ -206,7 +220,7 @@ function readWord(src: string, i: number, subs: string[]): { word: Word; end: nu
 	return { word: { value, raw, quoted: quoted && !sawUnquoted, hasExpansion }, end: j }
 }
 
-function tokenize(src: string): Token[] {
+function tokenize(src: string, diag?: LexDiagnostics): Token[] {
 	const tokens: Token[] = []
 	const subs: string[] = []
 	let i = 0
@@ -214,19 +228,23 @@ function tokenize(src: string): Token[] {
 	let atCommandStart = true
 
 	const drainHeredocs = () => {
-		// Called at a newline: consume heredoc bodies in order.
+		// Called at a newline: consume heredoc bodies in order. The inner loop can
+		// only exit without `found` by running out of input, so `!found` means the
+		// delimiter never appeared — an unterminated heredoc.
 		while (pendingHeredocs.length) {
 			const h = pendingHeredocs.shift()!
 			const lines: string[] = []
+			let found = false
 			while (i < src.length) {
 				let nl = src.indexOf("\n", i)
 				if (nl === -1) nl = src.length
 				let line = src.slice(i, nl)
 				i = nl + 1
 				const cmp = h.stripTabs ? line.replace(/^\t+/, "") : line
-				if (cmp === h.delimiter) break
+				if (cmp === h.delimiter) { found = true; break }
 				lines.push(line)
 			}
+			if (!found) fail(diag, `unterminated heredoc (<<${h.delimiter})`)
 			h.token.heredoc = { delimiter: h.delimiter, quoted: h.quoted, stripTabs: h.stripTabs }
 			;(h.token as { body?: string }).body = lines.join("\n")
 		}
@@ -275,6 +293,7 @@ function tokenize(src: string): Token[] {
 				if (src[i] === "'" || src[i] === '"') {
 					const q = src[i]!
 					const endQ = src.indexOf(q, i + 1)
+					if (endQ === -1) fail(diag, "unterminated quote in heredoc delimiter")
 					delimiter = src.slice(i + 1, endQ === -1 ? src.length : endQ)
 					quoted = true
 					i = endQ === -1 ? src.length : endQ + 1
@@ -301,12 +320,12 @@ function tokenize(src: string): Token[] {
 				continue
 			}
 			while (src[i] === " " || src[i] === "\t") i++
-			const { word, end } = readWord(src, i, subs)
+			const { word, end } = readWord(src, i, subs, diag)
 			i = end
 			tokens.push({ kind: "redirect", op, fd, target: word })
 			continue
 		}
-		const { word, end } = readWord(src, i, subs)
+		const { word, end } = readWord(src, i, subs, diag)
 		if (end === i) { i++; continue }
 		i = end
 		tokens.push({ kind: "word", word, raw: word.raw })
@@ -320,7 +339,17 @@ function tokenize(src: string): Token[] {
 
 /** Parse a command string into simple commands. */
 export function lexShell(command: string): SimpleCommand[] {
-	const tokens = tokenize(command)
+	return lexShellChecked(command).commands
+}
+
+/** Like lexShell, but also reports whether the input tokenised cleanly. `ok` is
+ *  false when the lexer ran off the end of the input mid-construct (unterminated
+ *  quote / heredoc / substitution) — i.e. the command is malformed and the
+ *  segment list is unreliable. Callers should refuse-and-ask-to-fix rather than
+ *  trust the fabricated segments. */
+export function lexShellChecked(command: string): { commands: SimpleCommand[]; ok: boolean; reason?: string } {
+	const diag: LexDiagnostics = { ok: true }
+	const tokens = tokenize(command, diag)
 	const allSubs = ((tokens as unknown as { subs?: string[] }).subs ?? []).slice()
 	const commands: SimpleCommand[] = []
 	let cur: SimpleCommand | null = null
@@ -414,7 +443,7 @@ export function lexShell(command: string): SimpleCommand[] {
 		const owner = commands.find((c) => c.raw.includes(sub))
 		;(owner ?? commands[0])?.substitutions.push(sub)
 	}
-	return commands
+	return { commands, ok: diag.ok, reason: diag.reason }
 }
 
 /** Render argv back to a readable string (values, not raw). */
