@@ -67,6 +67,11 @@ Auto mode routes every tool call through a three-layer gate (spec: [docs/CLASSIF
 3. **Effect classification** for commands the tables cannot read (inline `python -c`,
    unknown binaries): same schema-constrained call, mapped back onto the tiers.
 
+If the user says **"don't change anything" / "read-only"**, the gate enters a read-only
+posture: ask/unknown *mutations* are refused (with an honest reason) while reads and the
+agent's own project-folder / `/tmp` writes still proceed. A later "you can write to /x/"
+re-permits that target; "you can make changes now" lifts it. `/grants` shows when it's active.
+
 If a bash command is **malformed** (unterminated quote / heredoc / `$( )`), the lexer
 reports it instead of emitting garbage segments: the gate refuses to run it and returns
 a *fix-and-simplify-and-retry* message to the agent (no user prompt, no model call) so it

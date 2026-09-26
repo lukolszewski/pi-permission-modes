@@ -10,6 +10,8 @@ import {
 	mapActionToCategory,
 	MAX_FORBIDS,
 	MAX_GRANTS,
+	readOnlyActive,
+	readOnlyLiftedByGrant,
 	serializeLedger,
 	type ExtractedEvent,
 	type Ledger,
@@ -225,7 +227,7 @@ describe("eventsFromExtraction verification", () => {
 		)
 		expect(none).toEqual([])
 	})
-	it("'all' revocation with unmappable action forbids everything until re-granted", () => {
+	it("'all' revocation with unmappable action sets the read-only posture (enforced by the gate, not ledgerCovers)", () => {
 		const ev = eventsFromExtraction(
 			{ grants: [], revocations: [{ action: "risky work", targets: [], all: true, quote: "stop, don't run anything risky anymore" }] },
 			"m1", 50, "stop, don't run anything risky anymore",
@@ -233,7 +235,45 @@ describe("eventsFromExtraction verification", () => {
 		const l = createLedger()
 		applyEvent(l, grant("write_outside", "/data/", 10))
 		applyEvents(l, ev)
-		expect(ledgerCovers(l, "write_outside", [T("/data/x")]).forbidden).toBe(true)
+		// posture is set; the older grant (seq 10 < 50) does not lift it
+		expect(readOnlyActive(l)?.seq).toBe(50)
+		expect(readOnlyLiftedByGrant(l, "write_outside", [T("/data/x")], 50)).toBe(false)
+		expect(l.forbids).toHaveLength(0)
+	})
+	it("blanket 'don't change anything' sets the read-only posture, not a wildcard forbid", () => {
+		const l = createLedger()
+		applyEvents(l, eventsFromExtraction(
+			{ grants: [], revocations: [{ action: "change anything", targets: [], all: true, quote: "you are not allowed to change anything" }] },
+			"m0", 0, "you are not allowed to change anything",
+		))
+		expect(readOnlyActive(l)?.quote).toContain("change anything")
+		expect(l.forbids).toHaveLength(0) // no more */* forbid row
+	})
+	it("read-only: later per-target grant lifts that target, blanket re-enable clears it", () => {
+		const l = createLedger()
+		applyEvent(l, { type: "readonly-on", category: "*", value: "*", kind: "scope", quote: "do not change anything", messageId: "m0", seq: 0 })
+		expect(readOnlyLiftedByGrant(l, "write_outside", [T("/x/f")], 0)).toBe(false)
+		applyEvent(l, grant("write_outside", "/x/", 5, "you can write to /x/"))
+		expect(readOnlyLiftedByGrant(l, "write_outside", [T("/x/f")], 0)).toBe(true) // seq 5 > 0
+		expect(readOnlyLiftedByGrant(l, "write_outside", [T("/y/f")], 0)).toBe(false) // different target
+		expect(readOnlyLiftedByGrant(l, "write_outside", [], 0)).toBe(false) // targetless can't be lifted
+		applyEvents(l, eventsFromExtraction(
+			{ grants: [{ action: "make changes", targets: [], quote: "ok you can make changes now" }], revocations: [] },
+			"m9", 9, "ok you can make changes now",
+		))
+		expect(readOnlyActive(l)).toBeNull()
+	})
+	it("read-only posture is order-independent and re-armable (on/off/on by seq)", () => {
+		const evs: ExtractedEvent[] = [
+			{ type: "readonly-on", category: "*", value: "*", kind: "scope", quote: "read only please", messageId: "a", seq: 2 },
+			{ type: "readonly-off", category: "*", value: "*", kind: "scope", quote: "changes are fine", messageId: "b", seq: 5 },
+			{ type: "readonly-on", category: "*", value: "*", kind: "scope", quote: "actually stop changing things", messageId: "c", seq: 8 },
+		]
+		const results = [evs, [...evs].reverse(), [evs[1]!, evs[2]!, evs[0]!]].map((order) => {
+			const l = createLedger(); applyEvents(l, order); return readOnlyActive(l)?.seq ?? null
+		})
+		expect(new Set(results.map(String)).size).toBe(1)
+		expect(results[0]).toBe(8) // newest on (seq 8) wins
 	})
 	it("generic-kind revocation targets escalate to a category-wide forbid (G9 regression)", () => {
 		const l = createLedger()

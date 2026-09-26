@@ -172,6 +172,14 @@ An ASK decision is authorised when **any** of the following holds, checked in or
    covers the pending entities. Grants are exact entities or directory/namespace prefixes
    chosen by the user in the prompt; they are never widened automatically. Ledger and
    transcript grants (below) are promoted here on first use so repeats are free.
+ 2b. **Read-only posture** — a blanket "you are not allowed to change anything" /
+    "read-only" instruction sets a session posture (not a per-target forbid). While
+    active, any ask/unknown action that is a *change* (everything except plain reads)
+    is refused with an honest reason quoting the user; allow-tier project-folder and
+    /tmp work still proceeds (the project is excluded by default). A later per-target
+    grant ("you can write to /x/") lifts that target; a blanket "you can make changes
+    now" clears the posture. This replaces an earlier wildcard forbid that matched
+    hallucinated targets and mis-reported "user forbade «entity»".
 3. **Authorisation ledger** — pure code lookup against the per-session ledger of grants
    and forbids folded from per-message extraction (task 4.3); this is the whole-session
    memory, so authorisation is not a function of scroll position. All pending target

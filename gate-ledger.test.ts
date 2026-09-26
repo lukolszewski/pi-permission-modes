@@ -187,6 +187,60 @@ describe("named forbids bind on allow-tier (gap fix)", () => {
 	})
 })
 
+describe("read-only posture ('don't change anything')", () => {
+	const roLedger = () => ledgerWith([
+		{ type: "readonly-on", category: "*", value: "*", kind: "scope", quote: "you are not allowed to change anything", messageId: "m0", seq: 0 },
+	])
+	it("blocks an outside-project write (mutation), no model call", async () => {
+		const { fn } = mockExtractionFetch([])
+		const r = await runGate("bash", { command: "rm -rf ~/notes-old" }, {
+			policy: POLICY, endpoint: EP, ledger: roLedger(),
+		})
+		expect(r.outcome).toBe("prompt")
+		expect(r.reason).toMatch(/read-only/i)
+		expect(r.reason).toContain("change anything")
+		expect(fn).not.toHaveBeenCalled()
+	})
+	it("still ALLOWS project-folder and /tmp writes (excluded by default)", async () => {
+		const rProj = await runGate("write", { path: "src/a.ts", content: "x" }, { policy: POLICY, ledger: roLedger() })
+		expect(rProj.outcome).toBe("allow")
+		const rTmp = await runGate("bash", { command: "echo hi > /tmp/out.txt" }, { policy: POLICY, ledger: roLedger() })
+		expect(rTmp.outcome).toBe("allow")
+	})
+	it("still ALLOWS reads", async () => {
+		const r = await runGate("bash", { command: "cat /etc/hosts" }, { policy: POLICY, ledger: roLedger() })
+		expect(r.outcome).toBe("allow")
+	})
+	it("a later per-target grant lifts that target only", async () => {
+		const l = ledgerWith([
+			{ type: "readonly-on", category: "*", value: "*", kind: "scope", quote: "don't change anything", messageId: "m0", seq: 0 },
+			{ type: "grant", category: "write_outside", value: "/srv/exports/", kind: "scope", quote: "you can write to /srv/exports/", messageId: "m5", seq: 5 },
+		])
+		const rAllowed = await runGate("bash", { command: "rsync -a ./out /srv/exports/" }, { policy: POLICY, ledger: l })
+		expect(rAllowed.outcome).toBe("allow-granted")
+		const rBlocked = await runGate("bash", { command: "rsync -a ./out /other/place/" }, { policy: POLICY, ledger: l })
+		expect(rBlocked.outcome).toBe("prompt")
+		expect(rBlocked.reason).toMatch(/read-only/i)
+	})
+	it("a blanket re-enable clears the posture", async () => {
+		const l = ledgerWith([
+			{ type: "readonly-on", category: "*", value: "*", kind: "scope", quote: "read-only for now", messageId: "m0", seq: 0 },
+			{ type: "readonly-off", category: "*", value: "*", kind: "scope", quote: "ok you can make changes now", messageId: "m9", seq: 9 },
+		])
+		const { fn } = mockExtractionFetch([])
+		const r = await runGate("bash", { command: "rm -rf ~/notes-old" }, { policy: POLICY, endpoint: EP, ledger: l, userMessages: [] })
+		// posture cleared → falls through to normal ask handling (transcript/ prompt),
+		// no longer the read-only reason
+		expect(r.reason).not.toMatch(/read-only/i)
+	})
+	it("session grant (prompt approval) wins over read-only", async () => {
+		const grants = createGrantStore()
+		grants.grants.push({ category: "delete_recursive", value: "~/notes-old", kind: "entity", at: 1 })
+		const r = await runGate("bash", { command: "rm -rf ~/notes-old" }, { policy: POLICY, grants, ledger: roLedger() })
+		expect(r.outcome).toBe("allow-granted")
+	})
+})
+
 describe("collectUserMessageRefs", () => {
 	const branch = [
 		{ type: "message", id: "a1", message: { role: "user", content: "hello" } },

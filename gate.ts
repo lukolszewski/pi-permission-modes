@@ -21,7 +21,12 @@ import {
 	type ModelEndpoint,
 } from "./model-client.ts"
 import { addGrant, grantsCover, type GrantStore } from "./session-grants.ts"
-import { ledgerCovers, namedForbidCovers, type Ledger } from "./auth-ledger.ts"
+import { ledgerCovers, namedForbidCovers, readOnlyActive, readOnlyLiftedByGrant, type Ledger } from "./auth-ledger.ts"
+
+/** Categories that are reads, not "changes" — exempt from the read-only posture
+ *  (which is about writes/mutations). Everything else ask/unknown is treated as a
+ *  change under read-only (fail-safe on ambiguous/unknown commands). */
+const READ_ONLY_EXEMPT = new Set(["read_secret", "read_only"])
 
 export type GateOutcome =
 	| "allow"            // run it, no user involvement
@@ -149,12 +154,27 @@ export async function runGate(tool: string, input: Record<string, unknown>, opts
 		return finish("prompt-never", "never", policy, policy.description, modelCalls)
 	}
 
-	// ---- ASK: session grants first
+	// ---- ASK: session grants first (a prompt approval is the user's most explicit
+	// authority and wins even over a read-only posture)
 	if (opts.grants) {
 		const cover = grantsCover(opts.grants, policy.category, policy.entities)
 		if (cover.covered) {
 			dbg(`[gate] session grant covers: ${cover.by.join(", ")}`)
 			return finish("allow-granted", "ask", policy, `covered by earlier approval (${cover.by.join(", ")})`, modelCalls, "session-grant")
+		}
+	}
+
+	// ---- ASK: read-only posture ("you are not allowed to change anything").
+	// Refuse mutations (everything ask/unknown that is not a plain read); allow-tier
+	// project/temp work already returned above, so the project folder is excluded by
+	// default. A later per-target grant (seq > posture) lifts that target; a blanket
+	// "you can make changes now" clears the posture entirely.
+	if (opts.ledger) {
+		const ro = readOnlyActive(opts.ledger)
+		const primary = policy.category.split("+")[0] ?? policy.category
+		if (ro && !READ_ONLY_EXEMPT.has(primary) && !readOnlyLiftedByGrant(opts.ledger, policy.category, policy.entities, ro.seq)) {
+			dbg(`[gate] read-only posture blocks ${policy.category}: "${ro.quote.slice(0, 60)}"`)
+			return finish("prompt", "ask", policy, `read-only — you asked me not to change anything ("${ro.quote.slice(0, 100)}")`, modelCalls)
 		}
 	}
 

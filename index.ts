@@ -123,6 +123,7 @@ import {
 import {
 	createLedger,
 	deserializeLedger,
+	readOnlyActive,
 	serializeLedger,
 } from "./auth-ledger.ts";
 import type { ModelEndpoint } from "./model-client.ts";
@@ -1447,6 +1448,11 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       if (!gateLedger.forbids.length) lines.push("  (none)");
       for (const f of gateLedger.forbids) {
         lines.push(`  ${f.category === "*" ? "(all)" : f.category}  ${f.value}  — "${f.quote.slice(0, 90)}" (msg ${f.seq})`);
+      }
+      const ro = readOnlyActive(gateLedger);
+      if (ro) {
+        lines.push("");
+        lines.push(`READ-ONLY MODE active — "${ro.quote.slice(0, 90)}" (msg ${ro.seq}). Mutations are blocked; project/temp work still allowed. Say "you can make changes now" to lift it.`);
       }
       lines.push("");
       lines.push(`Extracted messages: ${gateLedger.seen.size}. Use /grants clear to reset.`);

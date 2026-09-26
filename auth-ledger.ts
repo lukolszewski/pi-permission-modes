@@ -41,16 +41,44 @@ export type Ledger = {
 	forbids: LedgerEntry[]
 	/** Message ids already extracted (or deliberately skipped: beyond backfill cap). */
 	seen: Set<string>
+	/** Read-only posture from a blanket "don't change anything" (§ readonly-posture-plan).
+	 *  When active, ask/unknown *mutations* are refused (allow-tier project/temp work
+	 *  still proceeds). Tracked as two max-seq scalars so the fold is order-independent
+	 *  and a later "you can make changes now" (higher seq) re-enables. */
+	readOnlyOn?: { seq: number; quote: string }
+	readOnlyOffSeq?: number
 }
 
 export type ExtractedEvent = {
-	type: "grant" | "forbid"
+	/** grant/forbid carry category+value+kind; readonly-on/off use them as "*". */
+	type: "grant" | "forbid" | "readonly-on" | "readonly-off"
 	category: string
 	value: string
 	kind: "entity" | "scope"
 	quote: string
 	messageId: string
 	seq: number
+}
+
+/** Is the read-only posture in force right now? (latest on beats latest off.) */
+export function readOnlyActive(ledger: Ledger): { quote: string; seq: number } | null {
+	const on = ledger.readOnlyOn
+	if (!on) return null
+	if ((ledger.readOnlyOffSeq ?? -1) >= on.seq) return null
+	return on
+}
+
+/** Under read-only, does a ledger grant made AFTER the posture (seq > roSeq) cover
+ *  ALL pending targets? Such a later grant re-permits that specific target
+ *  ("don't change anything" … later … "you can write to /x/"). A targetless
+ *  mutation cannot be lifted this way — only a blanket re-enable clears it. */
+export function readOnlyLiftedByGrant(ledger: Ledger, category: string, entities: Entity[], roSeq: number): boolean {
+	const primary = category.split("+")[0] ?? category
+	const targets = entities.filter((e) => e.kind === "target").map((e) => e.value)
+	if (targets.length === 0) return false
+	return targets.every((t) =>
+		ledger.grants.some((g) => g.seq > roSeq && compatible(g.category, primary) && valueCovers(g, t)),
+	)
 }
 
 export const MAX_GRANTS = 200
@@ -150,6 +178,16 @@ function sameKey(a: LedgerEntry, b: ExtractedEvent | LedgerEntry): boolean {
  *  (in either list) keep only the highest seq; broader/partial overlaps are
  *  BOTH kept and resolved by seq at match time. */
 export function applyEvent(ledger: Ledger, ev: ExtractedEvent): void {
+	if (ev.type === "readonly-on") {
+		if (!ledger.readOnlyOn || ev.seq > ledger.readOnlyOn.seq) {
+			ledger.readOnlyOn = { seq: ev.seq, quote: ev.quote }
+		}
+		return
+	}
+	if (ev.type === "readonly-off") {
+		ledger.readOnlyOffSeq = Math.max(ledger.readOnlyOffSeq ?? -1, ev.seq)
+		return
+	}
 	if (!ev.value || !ev.category) return
 	const mine = ev.type === "grant" ? ledger.grants : ledger.forbids
 	const other = ev.type === "grant" ? ledger.forbids : ledger.grants
@@ -327,6 +365,10 @@ const GENERIC_KIND_TARGETS = new Set([
 	"processes",
 ])
 
+/** Clear phrases that globally re-enable changes, lifting the read-only posture. */
+const RE_ENABLE_CHANGES =
+	/(?:(?:you (?:can|may)|go ahead(?: and)?|feel free to|ok(?:ay)? to|it'?s (?:ok|okay|fine) to|resume|re-?enable|allow)\b[^.]*\b(?:make changes?|changes?|modif\w*|writ\w*|edit\w*)\b)|(?:\bchanges? (?:are (?:ok|okay|fine|allowed|permitted)|enabled|allowed)\b)|(?:\b(?:no longer|not) read[- ]?only\b)/i
+
 /**
  * Convert one message's extraction into ledger events, dropping anything the
  * code cannot verify against the message text (fail-safe: a dropped event
@@ -373,9 +415,17 @@ export function eventsFromExtraction(
 			const low = t.trim().toLowerCase()
 			return !PRONOUN_TARGETS.has(low) && !GENERIC_KIND_TARGETS.has(low)
 		})
-		if (r.all === true || (targets.length > 0 && named.length === 0)) {
-			// no named target (or only generic kinds): forbid the whole category
-			out.push({ type: "forbid", category: cat, value: "*", kind: "scope", quote, messageId, seq })
+		const isBlanket = r.all === true || named.length === 0
+		if (isBlanket) {
+			if (cat === "*") {
+				// truly global "don't change anything / read-only" → session posture,
+				// not a wildcard forbid row (which would match hallucinated targets and
+				// report a fabricated "user forbade X").
+				out.push({ type: "readonly-on", category: "*", value: "*", kind: "scope", quote, messageId, seq })
+			} else {
+				// mapped category with no specific target: forbid that whole category
+				out.push({ type: "forbid", category: cat, value: "*", kind: "scope", quote, messageId, seq })
+			}
 			continue
 		}
 		for (const t of named) {
@@ -383,6 +433,21 @@ export function eventsFromExtraction(
 			// named revocations apply across all categories: "don't touch
 			// ~/backups" forbids deletes AND writes AND chmod there.
 			out.push({ type: "forbid", category: "*", value: t, kind: targetKind(t), quote, messageId, seq })
+		}
+	}
+	// Blanket re-enable ("ok, you can make changes now") lifts the read-only posture.
+	// Conservative phrase match, and only when no specific grant target is involved
+	// (a specific grant already overrides per-target via seq). Not classification —
+	// a clear re-enable phrase.
+	for (const g of x.grants ?? []) {
+		const quote = String(g.quote ?? "")
+		if (!quoteInMessage(quote, messageText)) continue
+		const hasTarget = (g.targets ?? []).some((t) => {
+			const low = String(t).trim().toLowerCase()
+			return low.length >= 2 && !PRONOUN_TARGETS.has(low) && !GENERIC_KIND_TARGETS.has(low)
+		})
+		if (!hasTarget && RE_ENABLE_CHANGES.test(quote)) {
+			out.push({ type: "readonly-off", category: "*", value: "*", kind: "scope", quote, messageId, seq })
 		}
 	}
 	return out
@@ -395,10 +460,19 @@ export type SerializedLedger = {
 	grants: LedgerEntry[]
 	forbids: LedgerEntry[]
 	seen: string[]
+	readOnlyOn?: { seq: number; quote: string }
+	readOnlyOffSeq?: number
 }
 
 export function serializeLedger(ledger: Ledger): SerializedLedger {
-	return { v: 1, grants: ledger.grants, forbids: ledger.forbids, seen: [...ledger.seen] }
+	return {
+		v: 1,
+		grants: ledger.grants,
+		forbids: ledger.forbids,
+		seen: [...ledger.seen],
+		readOnlyOn: ledger.readOnlyOn,
+		readOnlyOffSeq: ledger.readOnlyOffSeq,
+	}
 }
 
 /**
@@ -420,5 +494,9 @@ export function deserializeLedger(data: unknown, validMessageIds?: Set<string>):
 	for (const id of Array.isArray(s.seen) ? s.seen : []) {
 		if (typeof id === "string" && (!validMessageIds || validMessageIds.has(id))) ledger.seen.add(id)
 	}
+	if (s.readOnlyOn && typeof s.readOnlyOn.seq === "number" && typeof s.readOnlyOn.quote === "string") {
+		ledger.readOnlyOn = { seq: s.readOnlyOn.seq, quote: s.readOnlyOn.quote }
+	}
+	if (typeof s.readOnlyOffSeq === "number") ledger.readOnlyOffSeq = s.readOnlyOffSeq
 	return ledger
 }
