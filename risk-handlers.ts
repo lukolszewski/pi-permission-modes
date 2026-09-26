@@ -1058,18 +1058,47 @@ function hostOf(url: string): string {
 	return m?.[2] ?? url.slice(0, 60)
 }
 
+/** ssh options that take a separate-word value (`-o BatchMode=yes`, `-i key`,
+ *  `-p 22`, `-l user`…). Their values must not be mistaken for the host or the
+ *  remote command. */
+const SSH_VALUE_OPTS = new Set([
+	"-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m",
+	"-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w",
+])
+
+/** Positionals of an ssh-family command: host first, then the remote command,
+ *  skipping option values. `positionals()` drops `-o` but keeps `BatchMode=yes`. */
+function sshPositionals(argv: string[]): string[] {
+	const out: string[] = []
+	for (let i = 1; i < argv.length; i++) {
+		const a = argv[i]!
+		if (a === "--") { out.push(...argv.slice(i + 1)); break }
+		if (a.startsWith("-") && a !== "-") {
+			if (SSH_VALUE_OPTS.has(a)) i++ // skip the option's value
+			continue
+		}
+		out.push(a)
+	}
+	return out
+}
+
 function sshHandler(argv: string[], h: HandlerContext): SegmentDecision[] {
 	const raw = rawOf(h.cmd)
 	if (hasFlag(argv, "-R", "-L", "-D", "-w")) {
 		return [seg("ask", "network_listen", `ssh with port forwarding/tunnel`, raw, targetsOf(argv, h))]
 	}
-	const pos = positionals(argv).filter((p) => !/^\d+$/.test(p))
+	const pos = sshPositionals(argv).filter((p) => !/^\d+$/.test(p))
 	const host = pos[0] ?? ""
 	const remoteCmd = pos.slice(1).join(" ")
 	if (!remoteCmd) return [seg("ask", "network_send", `interactive ssh to ${host}`, raw, [target(host)])]
-	// classify the remote command; entities become host-scoped
+	// Classify the remote command and reflect its tier: a read-only remote command
+	// (echo/hostname/cat…) changes nothing, so it is a remote READ — not a mutation
+	// (consistent with auto-allowing `curl` GET). A mutating remote command keeps
+	// network_send (gated, and blocked by the read-only posture). Entities are
+	// host-scoped so a grant for the host covers repeats.
 	const inner = h.evaluateBash(remoteCmd)
 	if (inner.tier === "never") return [seg("never", inner.category, `on ${host}: ${inner.description}`, raw, [target(host)])]
+	if (inner.tier === "allow") return [seg("allow", "read_only", `read-only command on ${host}: ${remoteCmd.slice(0, 80)}`, raw, [target(host)])]
 	return [seg("ask", "network_send", `run on ${host}: ${remoteCmd.slice(0, 100)}`, raw, [target(host), scope(host)])]
 }
 

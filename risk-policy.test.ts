@@ -82,6 +82,27 @@ describe("evaluateBash unparseable gate", () => {
 	})
 })
 
+describe("ssh remote command classification", () => {
+	const ent = (cmd: string) =>
+		evaluateBash(cmd, OPTS).entities.filter((e) => e.kind === "target").map((e) => e.value)
+	it("skips -o/-i/-p option values so the host is correct, not the flag value", () => {
+		const d = evaluateBash(`ssh -o BatchMode=yes -o ConnectTimeout=10 kamserw "echo hi; hostname; whoami; date"`, OPTS)
+		expect(ent(`ssh -o BatchMode=yes kamserw "hostname"`)).toEqual(["kamserw"])
+		expect(d.entities.some((e) => e.value === "kamserw")).toBe(true)
+		expect(d.entities.some((e) => /BatchMode/.test(e.value))).toBe(false)
+	})
+	it("a read-only remote command is a remote READ (allow), not network_send", () => {
+		expect(evaluateBash(`ssh kamserw "echo CONNECTED; hostname; whoami; date"`, OPTS).tier).toBe("allow")
+		expect(evaluateBash(`ssh -i ~/.ssh/id_ed25519 -p 2222 kamserw "df -h; du -sh /storage1"`, OPTS).tier).toBe("allow")
+	})
+	it("a mutating remote command stays gated (network_send / never)", () => {
+		expect(evaluateBash(`ssh kamserw "rm -rf /storage1/old"`, OPTS).tier).toBe("ask")
+		expect(evaluateBash(`ssh kamserw "echo x > /etc/hosts"`, OPTS).tier).not.toBe("allow")
+		// interactive ssh (no command) can't be read-classified → still ask
+		expect(evaluateBash(`ssh kamserw`, OPTS).tier).toBe("ask")
+	})
+})
+
 describe("risk-paths", () => {
 	it("flags protected wipe locations", () => {
 		for (const p of ["/", "/etc", "~", "~/.ssh", "..", ".", "/home"]) {
